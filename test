@@ -3,7 +3,7 @@ import subprocess
 import time
 import statistics
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import parse_qsl
 import json
 import requests
@@ -13,7 +13,6 @@ requests.packages.urllib3.disable_warnings()
 URL_AUTH = "https:///token"
 URL_PROCESSING = "https:///triggerMailBox"
 URL_API = "https:///profiles/{processUid}"
-URL_STATUS = "https:///profiles/{processUid}"  # Same as URL_API if status is in same endpoint
 USERNAME = ""
 PASSWORD = ""
 BODY = "t"
@@ -22,9 +21,9 @@ PFX_PASSPHRASE = ""
 VERIFY_SSL = True
 
 # Performance Test Configuration
-TEST_DURATION = 10  # seconds
-MAX_THREADS = 15  # concurrent requests
-WARMUP_REQUESTS = 3  # warmup requests before testing
+TEST_DURATION = 30  # seconds
+MAX_THREADS = 50    # Can be set to 50, 100, or 200
+WARMUP_REQUESTS = 5
 TOKEN_REFRESH_TIME = 20  # seconds
 
 def ensure_requests_pkcs12():
@@ -56,6 +55,7 @@ class TokenManager:
         with self.lock:
             current_time = time.time()
             if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
+                print("Refreshing token...")
                 self.token = self._fetch_new_token()
                 self.token_timestamp = current_time
             return self.token
@@ -76,7 +76,7 @@ class TokenManager:
             response.raise_for_status()
             return response.json().get("access_token")
         except Exception as e:
-            print(f"Failed to fetch new token: {str(e)}", file=sys.stderr)
+            print(f"Token fetch failed: {str(e)}", file=sys.stderr)
             return None
 
 def get_processUid(requests_pkcs12, token):
@@ -94,7 +94,9 @@ def get_processUid(requests_pkcs12, token):
             timeout=30
         )
         response.raise_for_status()
-        return response.json().get("processUid")
+        processUid = response.json().get("processUid")
+        print(f"Generated processUid: {processUid}")  # Print when generated
+        return processUid
     except Exception as e:
         print(f"Failed to get processUid: {str(e)}", file=sys.stderr)
         return None
@@ -106,44 +108,6 @@ def check_status(requests_pkcs12, token, processUid):
     }
     try:
         response = requests_pkcs12.get(
-            URL_STATUS.format(processUid=processUid),
-            headers=headers,
-            pkcs12_filename=PFX_PATH,
-            pkcs12_password=PFX_PASSPHRASE,
-            verify=VERIFY_SSL,
-            timeout=30
-        )
-        response.raise_for_status()
-        return response.json().get("status") == "Completed"
-    except Exception as e:
-        print(f"Failed to check status for {processUid}: {str(e)}", file=sys.stderr)
-        return False
-
-def process_request(requests_pkcs12, token_manager, process_uids, results):
-    # Get fresh token
-    token = token_manager.get_token()
-    if not token:
-        results["failed_requests"] += 1
-        return
-    
-    # Get new processUid
-    processUid = get_processUid(requests_pkcs12, token)
-    if not processUid:
-        results["failed_requests"] += 1
-        return
-    
-    # Track the new processUid
-    with process_uids["lock"]:
-        process_uids["ids"].append(processUid)
-    
-    # Call the API
-    start_time = time.time()
-    try:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
-        }
-        response = requests_pkcs12.get(
             URL_API.format(processUid=processUid),
             headers=headers,
             pkcs12_filename=PFX_PATH,
@@ -151,43 +115,82 @@ def process_request(requests_pkcs12, token_manager, process_uids, results):
             verify=VERIFY_SSL,
             timeout=30
         )
-        response.raise_for_status()
-        elapsed = time.time() - start_time
-        
-        with results["lock"]:
-            results["total_requests"] += 1
-            results["successful_requests"] += 1
-            results["response_times"].append(elapsed)
+        # Print status code directly
+        print(f"processUid: {processUid} = {response.status_code} {response.reason}")
+        return response.status_code == 200
     except Exception as e:
-        elapsed = time.time() - start_time
-        with results["lock"]:
-            results["total_requests"] += 1
-            results["failed_requests"] += 1
-            results["response_times"].append(elapsed)
+        print(f"processUid: {processUid} = Error: {str(e)}")
+        return False
 
-def monitor_statuses(requests_pkcs12, token_manager, process_uids, stop_event):
+def worker(requests_pkcs12, token_manager, process_uids, results, stop_event):
     while not stop_event.is_set():
-        time.sleep(1)  # Check statuses every second
+        token = token_manager.get_token()
+        if not token:
+            time.sleep(1)
+            continue
+        
+        processUid = get_processUid(requests_pkcs12, token)
+        if not processUid:
+            continue
         
         with process_uids["lock"]:
-            current_uids = process_uids["ids"].copy()
+            process_uids["ids"].append(processUid)
+        
+        start_time = time.time()
+        try:
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json"
+            }
+            response = requests_pkcs12.get(
+                URL_API.format(processUid=processUid),
+                headers=headers,
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            elapsed = time.time() - start_time
+            
+            # Print immediate response status
+            print(f"processUid: {processUid} = {response.status_code} {response.reason}")
+            
+            with results["lock"]:
+                results["total_requests"] += 1
+                if response.status_code == 200:
+                    results["successful_requests"] += 1
+                else:
+                    results["failed_requests"] += 1
+                results["response_times"].append(elapsed)
+        except Exception as e:
+            elapsed = time.time() - start_time
+            print(f"processUid: {processUid} = Error: {str(e)}")
+            with results["lock"]:
+                results["total_requests"] += 1
+                results["failed_requests"] += 1
+                results["response_times"].append(elapsed)
+
+def monitor_statuses(requests_pkcs12, token_manager, process_uids, stop_event):
+    while not stop_event.is_set() or process_uids["ids"]:
+        time.sleep(1)  # Check every second
         
         token = token_manager.get_token()
         if not token:
             continue
             
+        with process_uids["lock"]:
+            current_uids = process_uids["ids"].copy()
+        
         for uid in current_uids:
             if check_status(requests_pkcs12, token, uid):
                 with process_uids["lock"]:
                     if uid in process_uids["ids"]:
                         process_uids["ids"].remove(uid)
-                print(f"Process {uid} completed successfully")
 
 def run_performance_test(requests_pkcs12):
     test_start_time = time.time()
     token_manager = TokenManager(requests_pkcs12)
     
-    # Initialize results and processUid tracker
     results = {
         "total_requests": 0,
         "successful_requests": 0,
@@ -203,7 +206,6 @@ def run_performance_test(requests_pkcs12):
         "lock": threading.Lock()
     }
     
-    # Start status monitoring thread
     stop_event = threading.Event()
     monitor_thread = threading.Thread(
         target=monitor_statuses,
@@ -213,38 +215,41 @@ def run_performance_test(requests_pkcs12):
     monitor_thread.start()
     
     # Warmup phase
-    print("Running warmup requests...")
-    for _ in range(WARMUP_REQUESTS):
-        process_request(requests_pkcs12, token_manager, process_uids, results)
+    print(f"Running {WARMUP_REQUESTS} warmup requests...")
+    warmup_threads = min(WARMUP_REQUESTS, MAX_THREADS)
+    with ThreadPoolExecutor(max_workers=warmup_threads) as executor:
+        futures = [executor.submit(
+            worker, requests_pkcs12, token_manager, process_uids, results, threading.Event()
+        ) for _ in range(WARMUP_REQUESTS)]
+        for future in as_completed(futures):
+            future.result()
     
-    print(f"Starting performance test for {TEST_DURATION} seconds with {MAX_THREADS} threads...")
-    
-    def worker():
-        while time.time() - test_start_time < TEST_DURATION:
-            process_request(requests_pkcs12, token_manager, process_uids, results)
-    
+    print(f"Starting main test with {MAX_THREADS} threads for {TEST_DURATION} seconds...")
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = [executor.submit(worker) for _ in range(MAX_THREADS)]
-        for future in futures:
+        futures = [executor.submit(
+            worker, requests_pkcs12, token_manager, process_uids, results, stop_event
+        ) for _ in range(MAX_THREADS)]
+        
+        # Let the test run for the specified duration
+        time.sleep(TEST_DURATION)
+        stop_event.set()
+        
+        for future in as_completed(futures):
             future.result()
     
     results["test_end_time"] = time.time()
-    stop_event.set()
-    monitor_thread.join()
     
-    # Wait for remaining processes to complete (with timeout)
+    # Final wait for completion
     print("Waiting for remaining processes to complete...")
     wait_start = time.time()
-    while time.time() - wait_start < 30:  # 30-second timeout
-        with process_uids["lock"]:
-            if not process_uids["ids"]:
-                break
+    while time.time() - wait_start < 30 and process_uids["ids"]:
         time.sleep(1)
     
     with process_uids["lock"]:
         if process_uids["ids"]:
             print(f"Warning: {len(process_uids['ids'])} processes did not complete")
     
+    monitor_thread.join(timeout=5)
     return results
 
 def analyze_results(results):
@@ -253,13 +258,13 @@ def analyze_results(results):
 
     actual_duration = results["test_end_time"] - results["test_start_time"]
     requests_per_second = results["total_requests"] / actual_duration
-    error_rate = (results["failed_requests"] / results["total_requests"]) * 100
+    error_rate = (results["failed_requests"] / results["total_requests"]) * 100 if results["total_requests"] > 0 else 0
 
     if results["response_times"]:
         avg_response_time = statistics.mean(results["response_times"])
         min_response_time = min(results["response_times"])
         max_response_time = max(results["response_times"])
-        percentile_95 = statistics.quantiles(results["response_times"], n=100)[-1]
+        percentile_95 = statistics.quantiles(results["response_times"], n=100)[-1] if len(results["response_times"]) > 1 else results["response_times"][0]
     else:
         avg_response_time = min_response_time = max_response_time = percentile_95 = 0
 
