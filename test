@@ -7,15 +7,14 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 
-# Configuration - MUST UPDATE THESE VALUES
-BASE_URL = "https://api.example.com/"  # Update with your base API URL
-AUTH_ENDPOINT = "v1/auth"            # Update with your auth endpoint path
-PROCESSING_ENDPOINT = "v1/generate-processUid"
-STATUS_ENDPOINT = "v1/status/{processUid}"
-USERNAME = "your_username"            # Update with actual username
-PASSWORD = "your_password"           # Update with actual password
+# Configuration - Updated with three different URLs
+URL_AUTH = "https://api.example.com/v1/resource"  # Authentication endpoint
+URL_PROCESSING = "https://api.example2.com/v1/get-processUid"  # Process UID generation
+URL_API = "https://api.example3.com/v1/profile/{processUid}"  # Status checking
+USERNAME = "myusername"            # Update with actual username
+PASSWORD = "mypassword"           # Update with actual password
 PFX_PATH = "./client_cert.p12"        # Ensure this path is correct
-PFX_PASSPHRASE = "cert_password"      # Update with actual passphrase
+PFX_PASSPHRASE = "secret_passphrase"  # Update with actual passphrase
 VERIFY_SSL = True                     # Set to False if using self-signed certs
 
 # Performance Test Configuration
@@ -29,7 +28,6 @@ class APITester:
         self.requests_pkcs12 = self._ensure_requests_pkcs12()
         self.token = None
         self.auth_time = 0
-        self.base_url = BASE_URL
         self.session = None
 
     def _ensure_requests_pkcs12(self):
@@ -52,10 +50,8 @@ class APITester:
                 "Accept": "application/json"
             })
 
-    def _make_request(self, method, endpoint, **kwargs):
+    def _make_request(self, method, url, **kwargs):
         """Generic request handler with error handling"""
-        url = urljoin(self.base_url, endpoint)
-        
         # Default parameters
         params = {
             "verify": VERIFY_SSL,
@@ -93,7 +89,6 @@ class APITester:
 
     def authenticate(self):
         """Authenticate and get access token with multiple fallback methods"""
-        auth_url = urljoin(self.base_url, AUTH_ENDPOINT)
         start_time = time.time()
         
         auth_methods = [
@@ -104,7 +99,7 @@ class APITester:
         
         for method in auth_methods:
             try:
-                self.token = method(auth_url)
+                self.token = method(URL_AUTH)
                 if self.token:
                     self.auth_time = time.time() - start_time
                     self._create_session()
@@ -173,7 +168,7 @@ class APITester:
             try:
                 response = self._make_request(
                     "POST",
-                    PROCESSING_ENDPOINT
+                    URL_PROCESSING
                 )
                 process_uid = response.json().get("processUid")
                 if process_uid:
@@ -186,7 +181,7 @@ class APITester:
 
     def check_status(self, process_uid):
         """Check status of a process with retries"""
-        endpoint = STATUS_ENDPOINT.format(processUid=process_uid)
+        endpoint = URL_API.format(processUid=process_uid)
         
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -297,7 +292,9 @@ class APITester:
         
         return {
             "test_configuration": {
-                "base_url": self.base_url,
+                "auth_url": URL_AUTH,
+                "processing_url": URL_PROCESSING,
+                "api_url": URL_API,
                 "test_duration_seconds": TEST_DURATION,
                 "max_threads": MAX_THREADS,
                 "poll_interval": POLL_INTERVAL,
