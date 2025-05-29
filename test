@@ -1,1 +1,359 @@
-html
+import sys
+import subprocess
+import time
+import statistics
+import json
+import requests
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin
+
+# Configuration - MUST UPDATE THESE VALUES
+BASE_URL = "https://api.example.com/"  # Update with your base API URL
+AUTH_ENDPOINT = "v1/auth"            # Update with your auth endpoint path
+PROCESSING_ENDPOINT = "v1/generate-processUid"
+STATUS_ENDPOINT = "v1/status/{processUid}"
+USERNAME = "your_username"            # Update with actual username
+PASSWORD = "your_password"           # Update with actual password
+PFX_PATH = "./client_cert.p12"        # Ensure this path is correct
+PFX_PASSPHRASE = "cert_password"      # Update with actual passphrase
+VERIFY_SSL = True                     # Set to False if using self-signed certs
+
+# Performance Test Configuration
+TEST_DURATION = 60                    # seconds
+MAX_THREADS = 10                      # concurrent requests
+POLL_INTERVAL = 2                     # seconds between status checks
+MAX_RETRIES = 5                       # max retries for Completed status
+
+class APITester:
+    def __init__(self):
+        self.requests_pkcs12 = self._ensure_requests_pkcs12()
+        self.token = None
+        self.auth_time = 0
+        self.base_url = BASE_URL
+        self.session = None
+
+    def _ensure_requests_pkcs12(self):
+        """Ensure requests_pkcs12 is available"""
+        try:
+            import requests_pkcs12
+            return requests_pkcs12
+        except ImportError:
+            print("Installing requests_pkcs12...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
+            import requests_pkcs12
+            return requests_pkcs12
+
+    def _create_session(self):
+        """Create a reusable session with authentication"""
+        self.session = requests.Session()
+        if self.token:
+            self.session.headers.update({
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json"
+            })
+
+    def _make_request(self, method, endpoint, **kwargs):
+        """Generic request handler with error handling"""
+        url = urljoin(self.base_url, endpoint)
+        
+        # Default parameters
+        params = {
+            "verify": VERIFY_SSL,
+            "timeout": 30,
+            **kwargs
+        }
+        
+        if PFX_PATH:
+            params.update({
+                "pkcs12_filename": PFX_PATH,
+                "pkcs12_password": PFX_PASSPHRASE
+            })
+        
+        try:
+            if method.upper() == "GET":
+                response = self.requests_pkcs12.get(url, **params)
+            elif method.upper() == "POST":
+                response = self.requests_pkcs12.post(url, **params)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+            
+            response.raise_for_status()
+            return response
+        
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Request failed: {method} {url}"
+            if hasattr(e, 'response') and e.response:
+                error_msg += f" | Status: {e.response.status_code}"
+                try:
+                    error_msg += f" | Response: {e.response.text[:200]}"
+                except:
+                    pass
+            print(error_msg, file=sys.stderr)
+            raise
+
+    def authenticate(self):
+        """Authenticate and get access token with multiple fallback methods"""
+        auth_url = urljoin(self.base_url, AUTH_ENDPOINT)
+        start_time = time.time()
+        
+        auth_methods = [
+            self._try_certificate_auth,
+            self._try_basic_auth,
+            self._try_token_auth
+        ]
+        
+        for method in auth_methods:
+            try:
+                self.token = method(auth_url)
+                if self.token:
+                    self.auth_time = time.time() - start_time
+                    self._create_session()
+                    return True
+            except Exception as e:
+                print(f"Auth method failed: {e.__class__.__name__}: {e}")
+        
+        print("All authentication methods failed")
+        return False
+
+    def _try_certificate_auth(self, auth_url):
+        """Try authentication with client certificate"""
+        print("Attempting certificate authentication...")
+        response = self.requests_pkcs12.post(
+            auth_url,
+            auth=(USERNAME, PASSWORD),
+            pkcs12_filename=PFX_PATH,
+            pkcs12_password=PFX_PASSPHRASE,
+            verify=VERIFY_SSL,
+            timeout=30
+        )
+        return self._extract_token(response)
+
+    def _try_basic_auth(self, auth_url):
+        """Fallback to basic authentication without certificate"""
+        print("Attempting basic authentication...")
+        response = requests.post(
+            auth_url,
+            auth=(USERNAME, PASSWORD),
+            verify=VERIFY_SSL,
+            timeout=30
+        )
+        return self._extract_token(response)
+
+    def _try_token_auth(self, auth_url):
+        """Alternative token-based authentication if applicable"""
+        print("Attempting token authentication...")
+        response = requests.post(
+            auth_url,
+            headers={"Content-Type": "application/json"},
+            json={"username": USERNAME, "password": PASSWORD},
+            verify=VERIFY_SSL,
+            timeout=30
+        )
+        return self._extract_token(response)
+
+    def _extract_token(self, response):
+        """Extract token from various response formats"""
+        try:
+            data = response.json()
+            if 'access_token' in data:
+                return data['access_token']
+            elif 'token' in data:
+                return data['token']
+            else:
+                print(f"Unexpected auth response format: {data}")
+                return None
+        except ValueError:
+            print(f"Invalid JSON response: {response.text}")
+            return None
+
+    def generate_process_uids(self, count):
+        """Generate multiple process UIDs"""
+        uids = []
+        for _ in range(count):
+            try:
+                response = self._make_request(
+                    "POST",
+                    PROCESSING_ENDPOINT
+                )
+                process_uid = response.json().get("processUid")
+                if process_uid:
+                    uids.append(process_uid)
+                    print(f"Generated processUid: {process_uid}")
+            except Exception as e:
+                print(f"Failed to generate processUid: {e}")
+        
+        return uids
+
+    def check_status(self, process_uid):
+        """Check status of a process with retries"""
+        endpoint = STATUS_ENDPOINT.format(processUid=process_uid)
+        
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                start_time = time.time()
+                response = self._make_request("GET", endpoint)
+                elapsed = time.time() - start_time
+                
+                data = response.json()
+                status = data.get("status", "Unknown")
+                
+                return {
+                    "success": True,
+                    "status": status,
+                    "completed": status == "Completed",
+                    "attempt": attempt,
+                    "time": elapsed,
+                    "data": data
+                }
+                
+            except Exception as e:
+                elapsed = time.time() - start_time if 'start_time' in locals() else 0
+                if attempt < MAX_RETRIES:
+                    time.sleep(POLL_INTERVAL)
+        
+        return {
+            "success": False,
+            "error": str(e),
+            "time": elapsed,
+            "attempt": attempt
+        }
+
+    def run_performance_test(self):
+        """Run the complete performance test"""
+        test_start_time = time.time()
+        
+        if not self.authenticate():
+            return None
+        
+        process_uids = self.generate_process_uids(MAX_THREADS)
+        if not process_uids:
+            print("Failed to generate any processUids")
+            return None
+        
+        results = {
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "completed_processes": 0,
+            "incomplete_processes": 0,
+            "response_times": [],
+            "process_uids": process_uids,
+            "test_start_time": test_start_time,
+            "test_end_time": 0,
+            "auth_time": self.auth_time,
+            "detailed_results": []
+        }
+        
+        print(f"\nStarting performance test with {len(process_uids)} processUids for {TEST_DURATION} seconds...")
+        
+        def worker(process_uid):
+            nonlocal results
+            while time.time() - results["test_start_time"] < TEST_DURATION + results["auth_time"]:
+                result = self.check_status(process_uid)
+                results["total_requests"] += 1
+                results["detailed_results"].append({
+                    "process_uid": process_uid,
+                    "result": result
+                })
+                
+                if result["success"]:
+                    results["successful_requests"] += 1
+                    results["response_times"].append(result["time"])
+                    
+                    if result.get("completed", False):
+                        results["completed_processes"] += 1
+                    else:
+                        results["incomplete_processes"] += 1
+                else:
+                    results["failed_requests"] += 1
+                
+                time.sleep(POLL_INTERVAL)
+        
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = [executor.submit(worker, uid) for uid in process_uids]
+            for future in futures:
+                future.result()
+        
+        results["test_end_time"] = time.time()
+        return results
+
+    def analyze_results(self, results):
+        """Analyze and summarize test results"""
+        if not results:
+            return None
+        
+        actual_duration = results["test_end_time"] - results["test_start_time"]
+        requests_per_second = results["total_requests"] / actual_duration
+        error_rate = (results["failed_requests"] / results["total_requests"]) * 100 if results["total_requests"] > 0 else 0
+        completion_rate = (results["completed_processes"] / len(results["process_uids"])) * 100 if results["process_uids"] else 0
+        
+        if results["response_times"]:
+            avg_response_time = statistics.mean(results["response_times"])
+            min_response_time = min(results["response_times"])
+            max_response_time = max(results["response_times"])
+            percentile_95 = statistics.quantiles(results["response_times"], n=100)[-1]
+        else:
+            avg_response_time = min_response_time = max_response_time = percentile_95 = 0
+        
+        return {
+            "test_configuration": {
+                "base_url": self.base_url,
+                "test_duration_seconds": TEST_DURATION,
+                "max_threads": MAX_THREADS,
+                "poll_interval": POLL_INTERVAL,
+                "max_retries": MAX_RETRIES
+            },
+            "authentication": {
+                "auth_time_seconds": results["auth_time"],
+                "token_obtained": bool(self.token)
+            },
+            "processes": {
+                "total_process_uids": len(results["process_uids"]),
+                "completed_processes": results["completed_processes"],
+                "incomplete_processes": results["incomplete_processes"],
+                "completion_rate_percent": completion_rate
+            },
+            "requests": {
+                "total_requests": results["total_requests"],
+                "successful_requests": results["successful_requests"],
+                "failed_requests": results["failed_requests"],
+                "error_rate_percent": error_rate,
+                "requests_per_second": requests_per_second
+            },
+            "response_times": {
+                "average_seconds": avg_response_time,
+                "minimum_seconds": min_response_time,
+                "maximum_seconds": max_response_time,
+                "95th_percentile_seconds": percentile_95
+            },
+            "test_duration_seconds": actual_duration
+        }
+
+def main():
+    print("Starting API Performance Test\n")
+    
+    tester = APITester()
+    test_results = tester.run_performance_test()
+    
+    if not test_results:
+        print("\nPerformance test failed. Possible issues:")
+        print("1. Authentication failed - check credentials and certificate")
+        print("2. API endpoints are incorrect")
+        print("3. Network connectivity issues")
+        print("4. Server-side problems")
+        return
+    
+    analysis = tester.analyze_results(test_results)
+    
+    print("\n=== Performance Test Summary ===")
+    print(json.dumps(analysis, indent=2))
+    
+    print("\n=== Sample Detailed Results ===")
+    for i, detail in enumerate(test_results["detailed_results"][:3]):
+        print(f"\nSample {i+1} for processUid {detail['process_uid']}:")
+        print(json.dumps(detail["result"], indent=2))
+    
+    print("\nTest completed")
+
+if __name__ == "__main__":
+    main()
