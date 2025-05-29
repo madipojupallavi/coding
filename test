@@ -7,6 +7,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import parse_qsl
 import json
 import requests
+import pandas as pd
+from openpyxl import Workbook
+from datetime import datetime
 requests.packages.urllib3.disable_warnings()
 
 # Configuration
@@ -21,9 +24,10 @@ PFX_PASSPHRASE = ""
 VERIFY_SSL = True
 
 # Test Configuration
-TOTAL_PROCESSES = 50  # Exactly 50 processUids will be generated
-MAX_THREADS = 50      # Number of concurrent threads
+TOTAL_PROCESSES = 50  # Exact number of processes to test
+MAX_THREADS = 50      # Concurrent threads
 TOKEN_REFRESH_TIME = 20  # seconds
+OUTPUT_EXCEL = f"API_Test_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
 def ensure_requests_pkcs12():
     try:
@@ -34,16 +38,8 @@ def ensure_requests_pkcs12():
         import requests_pkcs12
         return requests_pkcs12
 
-def load_body(body_arg):
-    try:
-        with open(body_arg, "r", encoding="utf-8") as f:
-            raw = f.read().strip()
-    except (OSError, IOError):
-        raw = body_arg.strip()
-    pairs = parse_qsl(raw, keep_blank_values=True)
-    return dict(pairs)
-
 class TokenManager:
+    """Handles token generation and refresh"""
     def __init__(self, requests_pkcs12):
         self.requests_pkcs12 = requests_pkcs12
         self.token = None
@@ -54,13 +50,13 @@ class TokenManager:
         with self.lock:
             current_time = time.time()
             if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
-                print("Refreshing token...")
                 self.token = self._fetch_new_token()
                 self.token_timestamp = current_time
+                print(f"New token generated at {datetime.fromtimestamp(current_time).strftime('%H:%M:%S')}")
             return self.token
     
     def _fetch_new_token(self):
-        data = load_body(BODY)
+        data = {"grant_type": "client_credentials"}
         try:
             response = self.requests_pkcs12.post(
                 URL_AUTH,
@@ -75,160 +71,176 @@ class TokenManager:
             response.raise_for_status()
             return response.json().get("access_token")
         except Exception as e:
-            print(f"Token fetch failed: {str(e)}", file=sys.stderr)
+            print(f"Token generation failed: {str(e)}")
             return None
 
-def get_processUid(requests_pkcs12, token):
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json"
-    }
-    try:
-        response = requests_pkcs12.get(
-            URL_PROCESSING,
-            headers=headers,
-            pkcs12_filename=PFX_PATH,
-            pkcs12_password=PFX_PASSPHRASE,
-            verify=VERIFY_SSL,
-            timeout=30
-        )
-        response.raise_for_status()
-        processUid = response.json().get("processUid")
-        print(f"Generated processUid: {processUid}")
-        return processUid
-    except Exception as e:
-        print(f"Failed to get processUid: {str(e)}", file=sys.stderr)
-        return None
-
-def process_request(requests_pkcs12, token_manager, processUid, results):
-    token = token_manager.get_token()
-    if not token:
-        return False
-    
-    start_time = time.time()
-    try:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
-        }
-        response = requests_pkcs12.get(
-            URL_API.format(processUid=processUid),
-            headers=headers,
-            pkcs12_filename=PFX_PATH,
-            pkcs12_password=PFX_PASSPHRASE,
-            verify=VERIFY_SSL,
-            timeout=30
-        )
-        elapsed = time.time() - start_time
-        status = f"{response.status_code} {response.reason}"
-        print(f"processUid: {processUid} = {status}")
+class TestRunner:
+    def __init__(self):
+        self.requests_pkcs12 = ensure_requests_pkcs12()
+        self.token_manager = TokenManager(self.requests_pkcs12)
+        self.results = []
+        self.lock = threading.Lock()
         
-        with results["lock"]:
-            results["total_requests"] += 1
-            if response.status_code == 200:
-                results["successful_requests"] += 1
-            else:
-                results["failed_requests"] += 1
-            results["response_times"].append(elapsed)
+    def generate_process_id(self, token):
+        """Generate processUid (GET)"""
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            response = self.requests_pkcs12.get(
+                URL_PROCESSING,
+                headers=headers,
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            response.raise_for_status()
+            process_id = response.json().get("processUid")
+            print(f"Generated ProcessID: {process_id}")
+            return process_id
+        except Exception as e:
+            print(f"ProcessID generation failed: {str(e)}")
+            return None
+
+    def check_api_status(self, token, process_id):
+        """Check API status (GET)"""
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            start_time = time.time()
+            response = self.requests_pkcs12.get(
+                URL_API.format(processUid=process_id),
+                headers=headers,
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            elapsed = time.time() - start_time
+            status = f"{response.status_code} {response.reason}"
+            return {
+                "status": status,
+                "response_time": elapsed,
+                "success": response.status_code == 200
+            }
+        except Exception as e:
+            return {
+                "status": f"Error: {str(e)}",
+                "response_time": 0,
+                "success": False
+            }
+
+    def worker(self):
+        """Single thread workflow"""
+        token = self.token_manager.get_token()
+        if not token:
+            return None
+            
+        process_id = self.generate_process_id(token)
+        if not process_id:
+            return None
+            
+        result = self.check_api_status(token, process_id)
         
-        return response.status_code == 200
-    except Exception as e:
-        elapsed = time.time() - start_time
-        print(f"processUid: {processUid} = Error: {str(e)}")
-        with results["lock"]:
-            results["total_requests"] += 1
-            results["failed_requests"] += 1
-            results["response_times"].append(elapsed)
-        return False
-
-def run_test():
-    requests_pkcs12 = ensure_requests_pkcs12()
-    token_manager = TokenManager(requests_pkcs12)
-    
-    results = {
-        "total_requests": 0,
-        "successful_requests": 0,
-        "failed_requests": 0,
-        "response_times": [],
-        "start_time": time.time(),
-        "lock": threading.Lock()
-    }
-    
-    # Step 1: Generate all processUids first
-    print(f"Generating {TOTAL_PROCESSES} processUids...")
-    process_uids = []
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = []
-        for _ in range(TOTAL_PROCESSES):
-            futures.append(executor.submit(get_processUid, requests_pkcs12, token_manager.get_token()))
+        with self.lock:
+            self.results.append({
+                "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "process_id": process_id,
+                "api_status": result["status"],
+                "response_time_sec": result["response_time"],
+                "success": result["success"]
+            })
         
-        for future in as_completed(futures):
-            processUid = future.result()
-            if processUid:
-                process_uids.append(processUid)
-    
-    if not process_uids:
-        print("No processUids were generated", file=sys.stderr)
-        return None
-    
-    # Step 2: Process all generated processUids
-    print(f"Processing {len(process_uids)} processUids...")
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = []
-        for processUid in process_uids:
-            futures.append(executor.submit(
-                process_request, 
-                requests_pkcs12, 
-                token_manager, 
-                processUid, 
-                results
-            ))
+        print(f"Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
+        return result
+
+    def generate_report(self, test_duration):
+        """Generate Excel report with detailed results"""
+        df = pd.DataFrame(self.results)
         
-        for future in as_completed(futures):
-            future.result()  # Just wait for completion
-    
-    results["end_time"] = time.time()
-    return results
+        # Calculate metrics
+        success_count = df['success'].sum()
+        success_rate = (success_count / len(df)) * 100
+        avg_response = df['response_time_sec'].mean()
+        
+        # Create Excel file with 2 sheets
+        with pd.ExcelWriter(OUTPUT_EXCEL, engine='openpyxl') as writer:
+            # Sheet 1: Detailed Results
+            df.to_excel(
+                writer, 
+                sheet_name='Detailed Results', 
+                index=False,
+                columns=[
+                    "token_generation_time",
+                    "process_id", 
+                    "api_status",
+                    "response_time_sec",
+                    "success"
+                ]
+            )
+            
+            # Sheet 2: Summary
+            summary_data = {
+                'Metric': [
+                    'Total Processes',
+                    'Successful',
+                    'Failed',
+                    'Success Rate',
+                    'Average Response Time',
+                    'Total Test Duration'
+                ],
+                'Value': [
+                    TOTAL_PROCESSES,
+                    success_count,
+                    TOTAL_PROCESSES - success_count,
+                    f"{success_rate:.2f}%",
+                    f"{avg_response:.4f} sec",
+                    f"{test_duration:.2f} sec"
+                ]
+            }
+            pd.DataFrame(summary_data).to_excel(
+                writer, 
+                sheet_name='Summary', 
+                index=False
+            )
+            
+            # Auto-adjust column widths
+            workbook = writer.book
+            for sheetname in writer.sheets:
+                sheet = workbook[sheetname]
+                for column in sheet.columns:
+                    max_length = max(
+                        len(str(cell.value)) for cell in column
+                    )
+                    sheet.column_dimensions[
+                        column[0].column_letter
+                    ].width = max_length + 2
 
-def analyze_results(results):
-    if not results or results["total_requests"] == 0:
-        return None
+            # Add conditional formatting for failures
+            sheet = workbook['Detailed Results']
+            red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+            for row in sheet.iter_rows(min_row=2, max_col=5, max_row=len(df)+1):
+                if not row[4].value:  # 'Success' column
+                    for cell in row:
+                        cell.fill = red_fill
 
-    actual_duration = results["end_time"] - results["start_time"]
-    requests_per_second = results["total_requests"] / actual_duration
-    error_rate = (results["failed_requests"] / results["total_requests"]) * 100 if results["total_requests"] > 0 else 0
-
-    if results["response_times"]:
-        avg_response_time = statistics.mean(results["response_times"])
-        min_response_time = min(results["response_times"])
-        max_response_time = max(results["response_times"])
-        percentile_95 = statistics.quantiles(results["response_times"], n=100)[-1] if len(results["response_times"]) > 1 else results["response_times"][0]
-    else:
-        avg_response_time = min_response_time = max_response_time = percentile_95 = 0
-
-    return {
-        "total_processes": results["total_requests"],
-        "successful_processes": results["successful_requests"],
-        "failed_processes": results["failed_requests"],
-        "error_rate_percent": error_rate,
-        "total_duration_seconds": actual_duration,
-        "requests_per_second": requests_per_second,
-        "avg_response_time_seconds": avg_response_time,
-        "min_response_time_seconds": min_response_time,
-        "max_response_time_seconds": max_response_time,
-        "95th_percentile_seconds": percentile_95
-    }
-
-def main():
-    test_results = run_test()
-    if not test_results:
-        print("Test failed to produce results", file=sys.stderr)
-        return None
-    
-    analysis = analyze_results(test_results)
-    print("\nTest Results:")
-    print(json.dumps(analysis, indent=2))
-    return analysis
+    def run_test(self):
+        """Execute test with multithreading"""
+        print(f"Starting test with {TOTAL_PROCESSES} processes using {MAX_THREADS} threads...")
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = [executor.submit(self.worker) for _ in range(TOTAL_PROCESSES)]
+            for future in as_completed(futures):
+                future.result()  # Wait for completion
+        
+        test_duration = time.time() - start_time
+        self.generate_report(test_duration)
+        
+        # Print final summary
+        success_count = sum(1 for r in self.results if r.get('success', False))
+        print(f"\nTest completed. Success: {success_count}/{TOTAL_PROCESSES}")
+        print(f"Report generated: {OUTPUT_EXCEL}")
+        return self.results
 
 if __name__ == "__main__":
-    main()
+    test = TestRunner()
+    results = test.run_test()
