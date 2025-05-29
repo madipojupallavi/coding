@@ -6,13 +6,14 @@ import json
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs
+import threading
 
 # ==============================================
 # CONFIGURATION SECTION - UPDATE THESE VALUES
 # ==============================================
-URL_AUTH = "https://api.example.com/v1/resource"          # Authentication endpoint
-URL_PROCESSING = "https://api.example2.com/v1/get-processUid"  # Process UID generation
-URL_API = "https://api.example3.com/v1/profile/{processUid}"    # Status checking
+URL_AUTH = "https://api.example.com/v1/resource"          # Authentication endpoint (POST)
+URL_PROCESSING = "https://api.example2.com/v1/get-processUid"  # Process UID generation (GET)
+URL_API = "https://api.example3.com/v1/profile/{processUid}"    # Status checking (GET)
 USERNAME = "myusername"                                   # API username
 PASSWORD = "mypassword"                                  # API password
 BODY = "key1=val1&key2=val2"                             # Request body for POST operations
@@ -33,6 +34,7 @@ class APITester:
         self.token = None
         self.auth_time = 0
         self.session = None
+        self.results_lock = threading.Lock()  # Thread safety for results
         self._parse_body()
 
     def _parse_body(self):
@@ -63,16 +65,26 @@ class APITester:
 
     def _create_session(self):
         """Create a reusable session with authentication"""
-        self.session = requests.Session()
+        if PFX_PATH:
+            self.session = self.requests_pkcs12.Session()
+            self.session.mount('https://', self.requests_pkcs12.Pkcs12Adapter(
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE
+            ))
+        else:
+            self.session = requests.Session()
+            
         if self.token:
             self.session.headers.update({
                 "Authorization": f"Bearer {self.token}",
-                "Accept": "application/json",
-                "Content-Type": "application/x-www-form-urlencoded"
+                "Accept": "application/json"
             })
 
     def _make_request(self, method, url, body=None, content_type=None, **kwargs):
         """Generic request handler with error handling"""
+        # Use session if available, otherwise fall back to direct requests
+        requester = self.session if self.session else self.requests_pkcs12
+        
         # Default parameters
         params = {
             "verify": VERIFY_SSL,
@@ -80,7 +92,8 @@ class APITester:
             **kwargs
         }
         
-        if PFX_PATH:
+        # Only add PKCS12 params if not using session (session handles this)
+        if PFX_PATH and not self.session:
             params.update({
                 "pkcs12_filename": PFX_PATH,
                 "pkcs12_password": PFX_PASSPHRASE
@@ -91,7 +104,7 @@ class APITester:
         if content_type:
             headers["Content-Type"] = content_type
         
-        if body:
+        if body and method.upper() == "POST":
             if isinstance(body, dict):
                 params['json'] = body
             else:
@@ -102,9 +115,9 @@ class APITester:
         
         try:
             if method.upper() == "GET":
-                response = self.requests_pkcs12.get(url, **params)
+                response = requester.get(url, **params)
             elif method.upper() == "POST":
-                response = self.requests_pkcs12.post(url, **params)
+                response = requester.post(url, **params)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
@@ -160,6 +173,7 @@ class APITester:
             timeout=30,
             headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
+        response.raise_for_status()
         return self._extract_token(response)
 
     def _try_basic_auth(self, auth_url):
@@ -173,6 +187,7 @@ class APITester:
             timeout=30,
             headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
+        response.raise_for_status()
         return self._extract_token(response)
 
     def _try_token_auth(self, auth_url):
@@ -190,6 +205,7 @@ class APITester:
             verify=VERIFY_SSL,
             timeout=30
         )
+        response.raise_for_status()
         return self._extract_token(response)
 
     def _try_custom_auth(self, auth_url):
@@ -221,16 +237,12 @@ class APITester:
             return None
 
     def generate_process_uids(self, count):
-        """Generate multiple process UIDs"""
+        """Generate multiple process UIDs using GET method"""
         uids = []
         for _ in range(count):
             try:
-                response = self._make_request(
-                    "POST",
-                    URL_PROCESSING,
-                    body=self.body_form,
-                    content_type="application/x-www-form-urlencoded"
-                )
+                # CORRECTED: Using GET method instead of POST
+                response = self._make_request("GET", URL_PROCESSING)
                 data = response.json()
                 process_uid = data.get("processUid") or data.get("process_id") or data.get("id")
                 if process_uid:
@@ -244,12 +256,14 @@ class APITester:
         return uids
 
     def check_status(self, process_uid):
-        """Check status of a process with retries"""
+        """Check status of a process with retries using GET method"""
         endpoint = URL_API.format(processUid=process_uid)
+        last_error = None
         
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 start_time = time.time()
+                # Using GET method to check status
                 response = self._make_request("GET", endpoint)
                 elapsed = time.time() - start_time
                 
@@ -266,6 +280,7 @@ class APITester:
                 }
                 
             except Exception as e:
+                last_error = e
                 elapsed = time.time() - start_time if 'start_time' in locals() else 0
                 print(f"Status check attempt {attempt} failed for {process_uid}: {e}")
                 if attempt < MAX_RETRIES:
@@ -273,9 +288,9 @@ class APITester:
         
         return {
             "success": False,
-            "error": str(e),
-            "time": elapsed,
-            "attempt": attempt
+            "error": str(last_error) if last_error else "Unknown error",
+            "time": elapsed if 'elapsed' in locals() else 0,
+            "attempt": MAX_RETRIES
         }
 
     def run_performance_test(self):
@@ -299,7 +314,7 @@ class APITester:
             print("Failed to generate any processUids. Cannot proceed with testing.")
             return None
         
-        # Initialize results
+        # Initialize results with thread-safe structure
         results = {
             "total_requests": 0,
             "successful_requests": 0,
@@ -318,26 +333,30 @@ class APITester:
         print(f"Using {len(process_uids)} processUids with {MAX_THREADS} threads")
         
         def worker(process_uid):
-            nonlocal results
-            while time.time() - results["test_start_time"] < TEST_DURATION + results["auth_time"]:
+            end_time = test_start_time + self.auth_time + TEST_DURATION
+            
+            while time.time() < end_time:
                 result = self.check_status(process_uid)
-                results["total_requests"] += 1
-                results["detailed_results"].append({
-                    "process_uid": process_uid,
-                    "timestamp": time.time(),
-                    "result": result
-                })
                 
-                if result["success"]:
-                    results["successful_requests"] += 1
-                    results["response_times"].append(result["time"])
+                # Thread-safe updates to results
+                with self.results_lock:
+                    results["total_requests"] += 1
+                    results["detailed_results"].append({
+                        "process_uid": process_uid,
+                        "timestamp": time.time(),
+                        "result": result
+                    })
                     
-                    if result.get("completed", False):
-                        results["completed_processes"] += 1
+                    if result["success"]:
+                        results["successful_requests"] += 1
+                        results["response_times"].append(result["time"])
+                        
+                        if result.get("completed", False):
+                            results["completed_processes"] += 1
+                        else:
+                            results["incomplete_processes"] += 1
                     else:
-                        results["incomplete_processes"] += 1
-                else:
-                    results["failed_requests"] += 1
+                        results["failed_requests"] += 1
                 
                 time.sleep(POLL_INTERVAL)
         
@@ -345,7 +364,10 @@ class APITester:
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             futures = [executor.submit(worker, uid) for uid in process_uids]
             for future in futures:
-                future.result()
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Worker thread failed: {e}")
         
         results["test_end_time"] = time.time()
         print("\n[4/4] Performance test completed")
@@ -357,7 +379,7 @@ class APITester:
             return None
         
         actual_duration = results["test_end_time"] - results["test_start_time"]
-        requests_per_second = results["total_requests"] / actual_duration
+        requests_per_second = results["total_requests"] / actual_duration if actual_duration > 0 else 0
         error_rate = (results["failed_requests"] / results["total_requests"]) * 100 if results["total_requests"] > 0 else 0
         completion_rate = (results["completed_processes"] / len(results["process_uids"])) * 100 if results["process_uids"] else 0
         
@@ -365,7 +387,15 @@ class APITester:
             avg_response_time = statistics.mean(results["response_times"])
             min_response_time = min(results["response_times"])
             max_response_time = max(results["response_times"])
-            percentile_95 = statistics.quantiles(results["response_times"], n=100)[-1]
+            
+            # Handle Python version compatibility for percentiles
+            try:
+                percentile_95 = statistics.quantiles(results["response_times"], n=100)[94]  # 95th percentile
+            except AttributeError:
+                # Fallback for older Python versions
+                sorted_times = sorted(results["response_times"])
+                index = int(0.95 * len(sorted_times))
+                percentile_95 = sorted_times[min(index, len(sorted_times) - 1)]
         else:
             avg_response_time = min_response_time = max_response_time = percentile_95 = 0
         
@@ -434,12 +464,17 @@ def main():
     
     print("\nStarting API Performance Test")
     print("="*50)
-    print(f"Authentication URL: {URL_AUTH}")
-    print(f"Processing URL: {URL_PROCESSING}")
-    print(f"API URL: {URL_API}")
+    print(f"Authentication URL: {URL_AUTH} (POST)")
+    print(f"Processing URL: {URL_PROCESSING} (GET)")
+    print(f"API URL: {URL_API} (GET)")
     print(f"Test Duration: {TEST_DURATION} seconds")
     print(f"Max Threads: {MAX_THREADS}")
-    print(f"Request Body: {BODY}")
+    print(f"Request Body (for auth): {BODY}")
+    print("="*50)
+    print("\nHTTP Methods:")
+    print("Step 1: POST → Get Token")
+    print("Step 2: GET → Get ProcessUID") 
+    print("Step 3: GET → Check Status (until 'Completed')")
     print("="*50)
     
     test_results = tester.run_performance_test()
