@@ -6,7 +6,6 @@ import json
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs
-import threading
 
 # ==============================================
 # CONFIGURATION SECTION - UPDATE THESE VALUES
@@ -34,7 +33,6 @@ class APITester:
         self.token = None
         self.auth_time = 0
         self.session = None
-        self.results_lock = threading.Lock()  # Thread safety for results
         self._parse_body()
 
     def _parse_body(self):
@@ -65,15 +63,7 @@ class APITester:
 
     def _create_session(self):
         """Create a reusable session with authentication"""
-        if PFX_PATH:
-            self.session = self.requests_pkcs12.Session()
-            self.session.mount('https://', self.requests_pkcs12.Pkcs12Adapter(
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE
-            ))
-        else:
-            self.session = requests.Session()
-            
+        self.session = requests.Session()
         if self.token:
             self.session.headers.update({
                 "Authorization": f"Bearer {self.token}",
@@ -83,9 +73,6 @@ class APITester:
 
     def _make_request(self, method, url, body=None, content_type=None, **kwargs):
         """Generic request handler with error handling"""
-        # Use session if available, otherwise fall back to direct requests
-        requester = self.session if self.session else self.requests_pkcs12
-        
         # Default parameters
         params = {
             "verify": VERIFY_SSL,
@@ -93,8 +80,7 @@ class APITester:
             **kwargs
         }
         
-        # Only add PKCS12 params if not using session (session handles this)
-        if PFX_PATH and not self.session:
+        if PFX_PATH:
             params.update({
                 "pkcs12_filename": PFX_PATH,
                 "pkcs12_password": PFX_PASSPHRASE
@@ -116,9 +102,9 @@ class APITester:
         
         try:
             if method.upper() == "GET":
-                response = requester.get(url, **params)
+                response = self.requests_pkcs12.get(url, **params)
             elif method.upper() == "POST":
-                response = requester.post(url, **params)
+                response = self.requests_pkcs12.post(url, **params)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
@@ -174,7 +160,6 @@ class APITester:
             timeout=30,
             headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
-        response.raise_for_status()
         return self._extract_token(response)
 
     def _try_basic_auth(self, auth_url):
@@ -188,7 +173,6 @@ class APITester:
             timeout=30,
             headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
-        response.raise_for_status()
         return self._extract_token(response)
 
     def _try_token_auth(self, auth_url):
@@ -206,7 +190,6 @@ class APITester:
             verify=VERIFY_SSL,
             timeout=30
         )
-        response.raise_for_status()
         return self._extract_token(response)
 
     def _try_custom_auth(self, auth_url):
@@ -263,7 +246,6 @@ class APITester:
     def check_status(self, process_uid):
         """Check status of a process with retries"""
         endpoint = URL_API.format(processUid=process_uid)
-        last_error = None
         
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -284,7 +266,6 @@ class APITester:
                 }
                 
             except Exception as e:
-                last_error = e
                 elapsed = time.time() - start_time if 'start_time' in locals() else 0
                 print(f"Status check attempt {attempt} failed for {process_uid}: {e}")
                 if attempt < MAX_RETRIES:
@@ -292,9 +273,9 @@ class APITester:
         
         return {
             "success": False,
-            "error": str(last_error) if last_error else "Unknown error",
-            "time": elapsed if 'elapsed' in locals() else 0,
-            "attempt": MAX_RETRIES
+            "error": str(e),
+            "time": elapsed,
+            "attempt": attempt
         }
 
     def run_performance_test(self):
@@ -318,7 +299,7 @@ class APITester:
             print("Failed to generate any processUids. Cannot proceed with testing.")
             return None
         
-        # Initialize results with thread-safe structure
+        # Initialize results
         results = {
             "total_requests": 0,
             "successful_requests": 0,
@@ -337,30 +318,26 @@ class APITester:
         print(f"Using {len(process_uids)} processUids with {MAX_THREADS} threads")
         
         def worker(process_uid):
-            end_time = test_start_time + self.auth_time + TEST_DURATION
-            
-            while time.time() < end_time:
+            nonlocal results
+            while time.time() - results["test_start_time"] < TEST_DURATION + results["auth_time"]:
                 result = self.check_status(process_uid)
+                results["total_requests"] += 1
+                results["detailed_results"].append({
+                    "process_uid": process_uid,
+                    "timestamp": time.time(),
+                    "result": result
+                })
                 
-                # Thread-safe updates to results
-                with self.results_lock:
-                    results["total_requests"] += 1
-                    results["detailed_results"].append({
-                        "process_uid": process_uid,
-                        "timestamp": time.time(),
-                        "result": result
-                    })
+                if result["success"]:
+                    results["successful_requests"] += 1
+                    results["response_times"].append(result["time"])
                     
-                    if result["success"]:
-                        results["successful_requests"] += 1
-                        results["response_times"].append(result["time"])
-                        
-                        if result.get("completed", False):
-                            results["completed_processes"] += 1
-                        else:
-                            results["incomplete_processes"] += 1
+                    if result.get("completed", False):
+                        results["completed_processes"] += 1
                     else:
-                        results["failed_requests"] += 1
+                        results["incomplete_processes"] += 1
+                else:
+                    results["failed_requests"] += 1
                 
                 time.sleep(POLL_INTERVAL)
         
@@ -368,10 +345,7 @@ class APITester:
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             futures = [executor.submit(worker, uid) for uid in process_uids]
             for future in futures:
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"Worker thread failed: {e}")
+                future.result()
         
         results["test_end_time"] = time.time()
         print("\n[4/4] Performance test completed")
@@ -383,7 +357,7 @@ class APITester:
             return None
         
         actual_duration = results["test_end_time"] - results["test_start_time"]
-        requests_per_second = results["total_requests"] / actual_duration if actual_duration > 0 else 0
+        requests_per_second = results["total_requests"] / actual_duration
         error_rate = (results["failed_requests"] / results["total_requests"]) * 100 if results["total_requests"] > 0 else 0
         completion_rate = (results["completed_processes"] / len(results["process_uids"])) * 100 if results["process_uids"] else 0
         
@@ -391,15 +365,7 @@ class APITester:
             avg_response_time = statistics.mean(results["response_times"])
             min_response_time = min(results["response_times"])
             max_response_time = max(results["response_times"])
-            
-            # Handle Python version compatibility for percentiles
-            try:
-                percentile_95 = statistics.quantiles(results["response_times"], n=100)[94]  # 95th percentile
-            except AttributeError:
-                # Fallback for older Python versions
-                sorted_times = sorted(results["response_times"])
-                index = int(0.95 * len(sorted_times))
-                percentile_95 = sorted_times[min(index, len(sorted_times) - 1)]
+            percentile_95 = statistics.quantiles(results["response_times"], n=100)[-1]
         else:
             avg_response_time = min_response_time = max_response_time = percentile_95 = 0
         
