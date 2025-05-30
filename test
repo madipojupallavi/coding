@@ -1,105 +1,439 @@
-def generate_report(self, test_duration):
-    """Generate Excel report with detailed failure analysis"""
-    df = pd.DataFrame(self.results)
-    
-    # Calculate metrics
-    success_count = df['success'].sum()
-    success_rate = (success_count / len(df)) * 100
-    avg_response = df['response_time_sec'].mean()
-    
-    # Create Excel file with 3 sheets
-    with pd.ExcelWriter(OUTPUT_EXCEL, engine='openpyxl') as writer:
-        # Sheet 1: Detailed Results
-        df.to_excel(
-            writer, 
-            sheet_name='All Requests', 
-            index=False,
-            columns=[
-                "token_generation_time",
-                "process_id", 
-                "api_status",
-                "response_time_sec",
-                "success",
-                "url"  # Added URL to the main sheet
-            ]
-        )
-        
-        # Sheet 2: Failed Requests (Detailed Analysis)
-        if not df[df['success'] == False].empty:
-            failed_df = df[df['success'] == False].copy()
-            failed_df['Failure Type'] = failed_df['api_status'].apply(
-                lambda x: 'HTTP Error' if str(x).isdigit() else 'Exception'
-            )
-            
-            # Select specific columns for failed requests sheet
-            failed_df.to_excel(
-                writer,
-                sheet_name='Failed Requests',
-                index=False,
-                columns=[
-                    "token_generation_time",
-                    "process_id",
-                    "url",
-                    "api_status",
-                    "response_time_sec",
-                    "Failure Type",
-                    "error_details"  # Assuming this field exists in your results
-                ]
-            )
-        
-        # Sheet 3: Summary
-        summary_data = {
-            'Metric': [
-                'Total Processes',
-                'Successful',
-                'Failed',
-                'Success Rate',
-                'Average Response Time',
-                'Total Test Duration',
-                'First Failure',
-                'Last Failure'
-            ],
-            'Value': [
-                TOTAL_PROCESSES,
-                success_count,
-                TOTAL_PROCESSES - success_count,
-                f"{success_rate:.2f}%",
-                f"{avg_response:.4f} sec",
-                f"{test_duration:.2f} sec",
-                df[df['success'] == False]['token_generation_time'].min() if not df[df['success'] == False].empty else 'N/A',
-                df[df['success'] == False]['token_generation_time'].max() if not df[df['success'] == False].empty else 'N/A'
-            ]
-        }
-        pd.DataFrame(summary_data).to_excel(
-            writer, 
-            sheet_name='Summary', 
-            index=False
-        )
-        
-        # Auto-adjust column widths and styling
-        workbook = writer.book
-        for sheetname in writer.sheets:
-            sheet = workbook[sheetname]
-            
-            # Auto-width
-            for col in sheet.columns:
-                max_length = max(len(str(cell.value)) for cell in col)
-                sheet.column_dimensions[col[0].column_letter].width = max_length + 2
-            
-            # Highlight failures in red
-            if sheetname == 'All Requests':
-                red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-                for row in sheet.iter_rows(min_row=2, max_col=6, max_row=len(df)+1):
-                    if not row[4].value:  # 'Success' column
-                        for cell in row:
-                            cell.fill = red_fill
+import sys
+import subprocess
+import time
+import statistics
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import parse_qsl
+import json
+import requests
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.formatting.rule import CellIsRule
+from datetime import datetime
+import numpy as np
+requests.packages.urllib3.disable_warnings()
 
-        # Add failure statistics if any failures occurred
-        if not df[df['success'] == False].empty:
-            failure_stats = df[df['success'] == False]['api_status'].value_counts().reset_index()
-            failure_stats.columns = ['Error Type', 'Count']
-            failure_stats.to_excel(
-                writer,
-                sheet_name='Failure Stats',
-                index=False
+# Configuration
+URL_AUTH = "https:///token"
+URL_PROCESSING = "https:///triggerMailBox"
+URL_API = "https:///profiles/{processUid}"
+USERNAME = ""
+PASSWORD = ""
+BODY = "t"
+PFX_PATH = ""
+PFX_PASSPHRASE = ""
+VERIFY_SSL = True
+
+# Test Configuration
+TOTAL_PROCESSES = 50  # Exact number of processes to test
+MAX_THREADS = 50      # Concurrent threads
+TOKEN_REFRESH_TIME = 20  # seconds
+OUTPUT_EXCEL = f"API_Test_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+def ensure_requests_pkcs12():
+    try:
+        import requests_pkcs12
+        return requests_pkcs12
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
+        import requests_pkcs12
+        return requests_pkcs12
+
+class TokenManager:
+    """Handles token generation and refresh"""
+    def __init__(self, requests_pkcs12):
+        self.requests_pkcs12 = requests_pkcs12
+        self.token = None
+        self.token_timestamp = 0
+        self.lock = threading.Lock()
+    
+    def get_token(self):
+        with self.lock:
+            current_time = time.time()
+            if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
+                self.token = self._fetch_new_token()
+                self.token_timestamp = current_time
+                print(f"New token generated at {datetime.fromtimestamp(current_time).strftime('%H:%M:%S')}")
+            return self.token
+    
+    def _fetch_new_token(self):
+        data = {"grant_type": "client_credentials"}
+        try:
+            response = self.requests_pkcs12.post(
+                URL_AUTH,
+                auth=(USERNAME, PASSWORD),
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
             )
+            response.raise_for_status()
+            return response.json().get("access_token")
+        except Exception as e:
+            print(f"Token generation failed: {str(e)}")
+            return None
+
+class TestRunner:
+    def __init__(self):
+        self.requests_pkcs12 = ensure_requests_pkcs12()
+        self.token_manager = TokenManager(self.requests_pkcs12)
+        self.results = []
+        self.lock = threading.Lock()
+        
+    def generate_process_id(self, token):
+        """Generate processUid (GET)"""
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            response = self.requests_pkcs12.get(
+                URL_PROCESSING,
+                headers=headers,
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            response.raise_for_status()
+            process_id = response.json().get("processUid")
+            print(f"Generated ProcessID: {process_id}")
+            return process_id
+        except Exception as e:
+            print(f"ProcessID generation failed: {str(e)}")
+            return None
+
+    def check_api_status(self, token, process_id):
+        """Check API status (GET)"""
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            start_time = time.time()
+            response = self.requests_pkcs12.get(
+                URL_API.format(processUid=process_id),
+                headers=headers,
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            elapsed = time.time() - start_time
+            status = f"{response.status_code} {response.reason}"
+            return {
+                "status": status,
+                "response_time": elapsed,
+                "success": response.status_code == 200,
+                "status_code": response.status_code
+            }
+        except Exception as e:
+            return {
+                "status": f"Error: {str(e)}",
+                "response_time": 0,
+                "success": False,
+                "status_code": 0
+            }
+
+    def worker(self):
+        """Single thread workflow"""
+        thread_start_time = time.time()
+        token = self.token_manager.get_token()
+        if not token:
+            return None
+            
+        process_id = self.generate_process_id(token)
+        if not process_id:
+            return None
+            
+        result = self.check_api_status(token, process_id)
+        total_time = time.time() - thread_start_time
+        
+        with self.lock:
+            self.results.append({
+                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                "process_id": process_id,
+                "api_status": result["status"],
+                "status_code": result["status_code"],
+                "response_time_sec": result["response_time"],
+                "total_time_sec": total_time,
+                "success": result["success"],
+                "thread_id": threading.current_thread().ident
+            })
+        
+        print(f"Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
+        return result
+
+    def calculate_performance_metrics(self, test_duration):
+        """Calculate comprehensive performance metrics"""
+        df = pd.DataFrame(self.results)
+        
+        # Basic counts
+        total_requests = len(df)
+        successful_requests = df['success'].sum()
+        failed_requests = total_requests - successful_requests
+        
+        # Success/Error rates
+        success_rate = (successful_requests / total_requests) * 100 if total_requests > 0 else 0
+        error_rate = (failed_requests / total_requests) * 100 if total_requests > 0 else 0
+        
+        # Response time statistics
+        response_times = df['response_time_sec'].values
+        avg_response_time = np.mean(response_times)
+        median_response_time = np.median(response_times)
+        min_response_time = np.min(response_times)
+        max_response_time = np.max(response_times)
+        p95_response_time = np.percentile(response_times, 95)
+        p99_response_time = np.percentile(response_times, 99)
+        std_response_time = np.std(response_times)
+        
+        # Throughput calculations
+        requests_per_second = total_requests / test_duration if test_duration > 0 else 0
+        
+        # Performance rating based on response times and success rate
+        performance_score = self.calculate_performance_score(avg_response_time, success_rate, p95_response_time)
+        
+        return {
+            'total_requests': total_requests,
+            'successful_requests': successful_requests,
+            'failed_requests': failed_requests,
+            'success_rate': success_rate,
+            'error_rate': error_rate,
+            'avg_response_time': avg_response_time,
+            'median_response_time': median_response_time,
+            'min_response_time': min_response_time,
+            'max_response_time': max_response_time,
+            'p95_response_time': p95_response_time,
+            'p99_response_time': p99_response_time,
+            'std_response_time': std_response_time,
+            'requests_per_second': requests_per_second,
+            'test_duration': test_duration,
+            'performance_score': performance_score
+        }
+
+    def calculate_performance_score(self, avg_response_time, success_rate, p95_response_time):
+        """Calculate overall performance score (0-100)"""
+        # Weight factors
+        success_weight = 0.4  # 40% weight for success rate
+        speed_weight = 0.4    # 40% weight for average response time
+        consistency_weight = 0.2  # 20% weight for P95 response time
+        
+        # Success rate score (0-100)
+        success_score = success_rate
+        
+        # Speed score (inverse relationship - lower response time = higher score)
+        # Assuming good response time is < 1s, acceptable is < 3s, poor is > 5s
+        if avg_response_time <= 1:
+            speed_score = 100
+        elif avg_response_time <= 3:
+            speed_score = 100 - ((avg_response_time - 1) / 2) * 50  # Linear decrease from 100 to 50
+        elif avg_response_time <= 5:
+            speed_score = 50 - ((avg_response_time - 3) / 2) * 30   # Linear decrease from 50 to 20
+        else:
+            speed_score = max(0, 20 - (avg_response_time - 5) * 5)  # Rapid decrease below 20
+        
+        # Consistency score based on P95
+        if p95_response_time <= 2:
+            consistency_score = 100
+        elif p95_response_time <= 5:
+            consistency_score = 100 - ((p95_response_time - 2) / 3) * 50
+        else:
+            consistency_score = max(0, 50 - (p95_response_time - 5) * 10)
+        
+        # Overall score
+        overall_score = (success_score * success_weight + 
+                        speed_score * speed_weight + 
+                        consistency_score * consistency_weight)
+        
+        return round(overall_score, 2)
+
+    def get_performance_rating(self, score):
+        """Get performance rating based on score"""
+        if score >= 90:
+            return "Excellent"
+        elif score >= 75:
+            return "Good"
+        elif score >= 60:
+            return "Fair"
+        elif score >= 40:
+            return "Poor"
+        else:
+            return "Critical"
+
+    def generate_report(self, test_duration):
+        """Generate comprehensive Excel report with performance metrics"""
+        df = pd.DataFrame(self.results)
+        metrics = self.calculate_performance_metrics(test_duration)
+        
+        # Create Excel file with multiple sheets
+        with pd.ExcelWriter(OUTPUT_EXCEL, engine='openpyxl') as writer:
+            # Sheet 1: Performance Summary
+            summary_data = {
+                'Performance Metric': [
+                    'Overall Performance Score',
+                    'Performance Rating',
+                    'Total API Requests',
+                    'Successful Requests',
+                    'Failed Requests',
+                    'Success Rate (%)',
+                    'Error Rate (%)',
+                    'Average Response Time (sec)',
+                    'Median Response Time (sec)',
+                    'Min Response Time (sec)',
+                    'Max Response Time (sec)',
+                    '95th Percentile Response Time (sec)',
+                    '99th Percentile Response Time (sec)',
+                    'Response Time Std Deviation',
+                    'Requests Per Second',
+                    'Total Test Duration (sec)',
+                    'Concurrent Threads Used'
+                ],
+                'Value': [
+                    f"{metrics['performance_score']}/100",
+                    self.get_performance_rating(metrics['performance_score']),
+                    metrics['total_requests'],
+                    metrics['successful_requests'],
+                    metrics['failed_requests'],
+                    f"{metrics['success_rate']:.2f}%",
+                    f"{metrics['error_rate']:.2f}%",
+                    f"{metrics['avg_response_time']:.4f}",
+                    f"{metrics['median_response_time']:.4f}",
+                    f"{metrics['min_response_time']:.4f}",
+                    f"{metrics['max_response_time']:.4f}",
+                    f"{metrics['p95_response_time']:.4f}",
+                    f"{metrics['p99_response_time']:.4f}",
+                    f"{metrics['std_response_time']:.4f}",
+                    f"{metrics['requests_per_second']:.2f}",
+                    f"{metrics['test_duration']:.2f}",
+                    MAX_THREADS
+                ]
+            }
+            pd.DataFrame(summary_data).to_excel(writer, sheet_name='Performance Summary', index=False)
+            
+            # Sheet 2: Successful APIs
+            successful_df = df[df['success'] == True].copy()
+            if not successful_df.empty:
+                successful_df = successful_df.sort_values('response_time_sec')
+                successful_df.to_excel(writer, sheet_name='Successful APIs', index=False)
+            
+            # Sheet 3: Failed APIs
+            failed_df = df[df['success'] == False].copy()
+            if not failed_df.empty:
+                failed_df = failed_df.sort_values('timestamp')
+                failed_df.to_excel(writer, sheet_name='Failed APIs', index=False)
+            
+            # Sheet 4: Detailed Results (All)
+            df_sorted = df.sort_values('timestamp')
+            df_sorted.to_excel(writer, sheet_name='All API Results', index=False)
+            
+            # Sheet 5: Response Time Analysis
+            response_time_analysis = pd.DataFrame({
+                'Response Time Range (sec)': ['0 - 1', '1 - 2', '2 - 3', '3 - 5', '> 5'],
+                'Count': [
+                    len(df[(df['response_time_sec'] >= 0) & (df['response_time_sec'] < 1)]),
+                    len(df[(df['response_time_sec'] >= 1) & (df['response_time_sec'] < 2)]),
+                    len(df[(df['response_time_sec'] >= 2) & (df['response_time_sec'] < 3)]),
+                    len(df[(df['response_time_sec'] >= 3) & (df['response_time_sec'] < 5)]),
+                    len(df[df['response_time_sec'] >= 5])
+                ]
+            })
+            response_time_analysis['Percentage'] = (response_time_analysis['Count'] / len(df) * 100).round(2)
+            response_time_analysis.to_excel(writer, sheet_name='Response Time Analysis', index=False)
+            
+            # Apply formatting
+            self.format_excel_sheets(writer, metrics)
+
+        print(f"\n{'='*60}")
+        print("PERFORMANCE TEST RESULTS SUMMARY")
+        print(f"{'='*60}")
+        print(f"Overall Performance Score: {metrics['performance_score']}/100 ({self.get_performance_rating(metrics['performance_score'])})")
+        print(f"Success Rate: {metrics['success_rate']:.2f}% ({metrics['successful_requests']}/{metrics['total_requests']})")
+        print(f"Error Rate: {metrics['error_rate']:.2f}% ({metrics['failed_requests']}/{metrics['total_requests']})")
+        print(f"Average Response Time: {metrics['avg_response_time']:.4f} seconds")
+        print(f"95th Percentile Response Time: {metrics['p95_response_time']:.4f} seconds")
+        print(f"Throughput: {metrics['requests_per_second']:.2f} requests/second")
+        print(f"Test Duration: {metrics['test_duration']:.2f} seconds")
+        print(f"Report Generated: {OUTPUT_EXCEL}")
+        print(f"{'='*60}")
+
+    def format_excel_sheets(self, writer, metrics):
+        """Apply formatting to Excel sheets"""
+        workbook = writer.book
+        
+        # Format Performance Summary sheet
+        if 'Performance Summary' in workbook.sheetnames:
+            ws = workbook['Performance Summary']
+            
+            # Header formatting
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center')
+            
+            # Color code performance score
+            score_cell = ws['B2']  # Performance score cell
+            score = metrics['performance_score']
+            if score >= 90:
+                score_cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Green
+            elif score >= 75:
+                score_cell.fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")  # Yellow
+            elif score >= 60:
+                score_cell.fill = PatternFill(start_color="FFD2A6", end_color="FFD2A6", fill_type="solid")  # Orange
+            else:
+                score_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Red
+        
+        # Auto-adjust column widths for all sheets
+        for sheetname in workbook.sheetnames:
+            ws = workbook[sheetname]
+            for column in ws.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)  # Cap at 50
+                ws.column_dimensions[column_letter].width = adjusted_width
+        
+        # Apply conditional formatting to failed APIs
+        if 'All API Results' in workbook.sheetnames:
+            ws = workbook['All API Results']
+            red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+            
+            # Find the success column
+            success_col = None
+            for i, cell in enumerate(ws[1], 1):
+                if cell.value == 'success':
+                    success_col = i
+                    break
+            
+            if success_col:
+                for row in range(2, ws.max_row + 1):
+                    if not ws.cell(row=row, column=success_col).value:  # If success is False
+                        for col in range(1, ws.max_column + 1):
+                            ws.cell(row=row, column=col).fill = red_fill
+
+    def run_test(self):
+        """Execute test with multithreading"""
+        print(f"Starting API Performance Test...")
+        print(f"Configuration: {TOTAL_PROCESSES} processes, {MAX_THREADS} threads")
+        print(f"{'='*60}")
+        
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = [executor.submit(self.worker) for _ in range(TOTAL_PROCESSES)]
+            completed = 0
+            for future in as_completed(futures):
+                future.result()
+                completed += 1
+                if completed % 10 == 0:  # Progress update every 10 completions
+                    print(f"Progress: {completed}/{TOTAL_PROCESSES} completed")
+        
+        test_duration = time.time() - start_time
+        self.generate_report(test_duration)
+        
+        return self.results
+
+if __name__ == "__main__":
+    test = TestRunner()
+    results = test.run_test()
