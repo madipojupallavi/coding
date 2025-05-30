@@ -1,7 +1,360 @@
-import os
+import sys
+import subprocess
+import time
+import statistics
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import requests
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill
+from datetime import datetime
 from pathlib import Path
+import os
 
-# 1. First, modify your OUTPUT_EXCEL definition at the top of your script:
-OUTPUT_DIR = Path("C:/performance_testing/results")  # ← Change this to your desired directory
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)  # Creates directory if it doesn't exist
+# Configuration
+URL_AUTH = "https:///token"
+URL_PROCESSING = "https:///triggerMailBox"
+URL_API = "https:///profiles/{processUid}"
+USERNAME = ""
+PASSWORD = ""
+BODY = "t"
+PFX_PATH = ""
+PFX_PASSPHRASE = ""
+VERIFY_SSL = True
+
+# Test Configuration
+TOTAL_PROCESSES = 50
+MAX_THREADS = 50
+TOKEN_REFRESH_TIME = 20  # seconds
+
+# Output Configuration (FIXED PATH HANDLING)
+OUTPUT_DIR = Path.cwd() / "performance_results"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_EXCEL = OUTPUT_DIR / f"API_Test_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+def ensure_requests_pkcs12():
+    try:
+        import requests_pkcs12
+        return requests_pkcs12
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
+        import requests_pkcs12
+        return requests_pkcs12
+
+class TokenManager:
+    def __init__(self, requests_pkcs12):
+        self.requests_pkcs12 = requests_pkcs12
+        self.token = None
+        self.token_timestamp = 0
+        self.lock = threading.Lock()
+        self.refresh_counter = 0
+    
+    def get_token(self):
+        with self.lock:
+            current_time = time.time()
+            if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
+                self.token = self._fetch_new_token()
+                self.token_timestamp = current_time
+                self.refresh_counter += 1
+                print(f"New token generated (Total refreshes: {self.refresh_counter})")
+            return self.token
+    
+    def _fetch_new_token(self):
+        data = {"grant_type": "client_credentials"}
+        try:
+            response = self.requests_pkcs12.post(
+                URL_AUTH,
+                auth=(USERNAME, PASSWORD),
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json().get("access_token")
+        except Exception as e:
+            print(f"Token generation failed: {str(e)}")
+            return None
+
+class TestRunner:
+    def __init__(self):
+        self.requests_pkcs12 = ensure_requests_pkcs12()
+        self.token_manager = TokenManager(self.requests_pkcs12)
+        self.results = []
+        self.lock = threading.Lock()
+        self.completed_processes = 0
+        
+    def generate_process_id(self, token):
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            response = self.requests_pkcs12.get(
+                URL_PROCESSING,
+                headers=headers,
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json().get("processUid")
+        except Exception as e:
+            print(f"ProcessID generation failed: {str(e)}")
+            return None
+
+    def check_api_status(self, token, process_id):
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            start_time = time.time()
+            response = self.requests_pkcs12.get(
+                URL_API.format(processUid=process_id),
+                headers=headers,
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            elapsed = time.time() - start_time
+            return {
+                "status": f"{response.status_code} {response.reason}",
+                "response_time": elapsed,
+                "success": response.status_code == 200
+            }
+        except Exception as e:
+            return {
+                "status": f"Error: {str(e)}",
+                "response_time": 0,
+                "success": False
+            }
+
+    def worker(self):
+        try:
+            token = self.token_manager.get_token()
+            if not token:
+                raise ValueError("Token generation failed")
+                
+            process_id = self.generate_process_id(token)
+            if not process_id:
+                raise ValueError("Process ID generation failed")
+                
+            result = self.check_api_status(token, process_id)
+            
+            with self.lock:
+                self.completed_processes += 1
+                self.results.append({
+                    "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "process_id": process_id,
+                    "api_status": result["status"],
+                    "response_time_sec": result["response_time"],
+                    "success": result["success"],
+                    "error_type": None if result["success"] else "HTTP"
+                })
+                print(f"[{self.completed_processes}/{TOTAL_PROCESSES}] Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
+                
+            return result
+            
+        except Exception as e:
+            with self.lock:
+                self.completed_processes += 1
+                self.results.append({
+                    "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "process_id": None,
+                    "api_status": f"CRASH: {str(e)}",
+                    "response_time_sec": 0,
+                    "success": False,
+                    "error_type": "SILENT"
+                })
+            print(f"⚠️ Worker failed: {str(e)}")
+            return None
+
+    def calculate_performance_metrics(self, test_duration):
+        total_processes = len(self.results)
+        http_failures = sum(1 for r in self.results if r["error_type"] == "HTTP")
+        silent_failures = sum(1 for r in self.results if r["error_type"] == "SILENT")
+        total_failures = http_failures + silent_failures
+        success_count = total_processes - total_failures
+        
+        response_times = [r["response_time_sec"] for r in self.results if r["success"]]
+        
+        return {
+            "total_processes": total_processes,
+            "successful_apis": success_count,
+            "http_failures": http_failures,
+            "silent_failures": silent_failures,
+            "error_rate": (total_failures / total_processes) * 100 if total_processes > 0 else 0,
+            "avg_latency": statistics.mean(response_times) if response_times else 0,
+            "min_latency": min(response_times) if response_times else 0,
+            "max_latency": max(response_times) if response_times else 0,
+            "median_latency": statistics.median(response_times) if response_times else 0,
+            "p90_latency": statistics.quantiles(response_times, n=10)[8] if response_times else 0,
+            "p95_latency": statistics.quantiles(response_times, n=20)[18] if response_times else 0,
+            "std_dev_latency": statistics.stdev(response_times) if len(response_times) > 1 else 0,
+            "total_duration": test_duration,
+            "throughput": total_processes / test_duration if test_duration > 0 else 0,
+            "refresh_count": self.token_manager.refresh_counter,
+            "error_types": {
+                "HTTP Errors": http_failures,
+                "Silent Failures": silent_failures
+            },
+            "response_time_distribution": {
+                "labels": ["0-0.5s", "0.5-1s", "1-1.5s", "1.5-2s", "2-2.5s", "2.5-3s", ">3s"],
+                "counts": [
+                    sum(1 for r in self.results if r["success"] and 0 <= r["response_time_sec"] < 0.5),
+                    sum(1 for r in self.results if r["success"] and 0.5 <= r["response_time_sec"] < 1),
+                    sum(1 for r in self.results if r["success"] and 1 <= r["response_time_sec"] < 1.5),
+                    sum(1 for r in self.results if r["success"] and 1.5 <= r["response_time_sec"] < 2),
+                    sum(1 for r in self.results if r["success"] and 2 <= r["response_time_sec"] < 2.5),
+                    sum(1 for r in self.results if r["success"] and 2.5 <= r["response_time_sec"] < 3),
+                    sum(1 for r in self.results if r["success"] and r["response_time_sec"] >= 3)
+                ]
+            }
+        }
+
+    def generate_report(self, test_duration, metrics):
+        try:
+            print(f"\n📊 Generating report at: {OUTPUT_EXCEL}")
+            
+            df_results = pd.DataFrame(self.results)
+            
+            with pd.ExcelWriter(
+                str(OUTPUT_EXCEL),
+                engine='openpyxl',
+                mode='w'
+            ) as writer:
+                # Sheet 1: Detailed Results
+                df_results.to_excel(
+                    writer,
+                    sheet_name='Detailed Results',
+                    index=False,
+                    columns=[
+                        "token_generation_time",
+                        "process_id",
+                        "api_status",
+                        "response_time_sec",
+                        "success",
+                        "error_type"
+                    ]
+                )
+                
+                # Sheet 2: Summary
+                summary_data = {
+                    'Metric': [
+                        'Total Processes',
+                        'Successful APIs',
+                        'HTTP Failures',
+                        'Silent Failures',
+                        'Error Rate',
+                        'Average Latency (s)',
+                        'Min Latency (s)',
+                        'Max Latency (s)',
+                        'Median Latency (s)',
+                        '90th Percentile (s)',
+                        '95th Percentile (s)',
+                        'Std Dev Latency (s)',
+                        'Total Duration (s)',
+                        'Throughput (req/s)',
+                        'Token Refresh Count'
+                    ],
+                    'Value': [
+                        metrics["total_processes"],
+                        metrics["successful_apis"],
+                        metrics["http_failures"],
+                        metrics["silent_failures"],
+                        f"{metrics['error_rate']:.2f}%",
+                        f"{metrics['avg_latency']:.4f}",
+                        f"{metrics['min_latency']:.4f}",
+                        f"{metrics['max_latency']:.4f}",
+                        f"{metrics['median_latency']:.4f}",
+                        f"{metrics['p90_latency']:.4f}",
+                        f"{metrics['p95_latency']:.4f}",
+                        f"{metrics['std_dev_latency']:.4f}",
+                        f"{metrics['total_duration']:.2f}",
+                        f"{metrics['throughput']:.2f}",
+                        metrics["refresh_count"]
+                    ]
+                }
+                pd.DataFrame(summary_data).to_excel(
+                    writer,
+                    sheet_name='Summary',
+                    index=False
+                )
+                
+                # Sheet 3: Error Breakdown
+                error_data = {
+                    'Error Type': list(metrics["error_types"].keys()),
+                    'Count': list(metrics["error_types"].values())
+                }
+                pd.DataFrame(error_data).to_excel(
+                    writer,
+                    sheet_name='Error Breakdown',
+                    index=False
+                )
+                
+                # Sheet 4: Response Time Distribution
+                dist_data = {
+                    'Response Time Range': metrics["response_time_distribution"]["labels"],
+                    'Count': metrics["response_time_distribution"]["counts"]
+                }
+                pd.DataFrame(dist_data).to_excel(
+                    writer,
+                    sheet_name='Response Times',
+                    index=False
+                )
+                
+                # Formatting
+                workbook = writer.book
+                red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                
+                for sheetname in writer.sheets:
+                    sheet = workbook[sheetname]
+                    # Bold headers
+                    for cell in sheet[1]:
+                        cell.font = cell.font.copy(bold=True)
+                    # Auto-adjust columns
+                    for col in sheet.columns:
+                        max_length = max(len(str(cell.value)) for cell in col)
+                        sheet.column_dimensions[col[0].column_letter].width = max_length + 2
+                
+                # Highlight failures
+                detail_sheet = workbook['Detailed Results']
+                for row in detail_sheet.iter_rows(min_row=2, max_row=len(df_results)+1):
+                    if not row[4].value:  # 'success' column
+                        for cell in row:
+                            cell.fill = red_fill
+                            
+            print("✅ Report generated successfully")
+            
+        except PermissionError:
+            print(f"❌ ERROR: Please close Excel file if open: {OUTPUT_EXCEL}")
+            raise
+        except Exception as e:
+            print(f"❌ Failed to generate report: {str(e)}")
+            raise
+
+    def run_test(self):
+        print(f"🚀 Starting test with {TOTAL_PROCESSES} processes using {MAX_THREADS} threads...")
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            futures = [executor.submit(self.worker) for _ in range(TOTAL_PROCESSES)]
+            for future in as_completed(futures):
+                future.result()  # Wait for completion
+        
+        test_duration = time.time() - start_time
+        metrics = self.calculate_performance_metrics(test_duration)
+        self.generate_report(test_duration, metrics)
+        
+        print("\n=== TEST COMPLETE ===")
+        print(f"Total duration: {test_duration:.2f}s")
+        print(f"Successful: {metrics['successful_apis']}/{TOTAL_PROCESSES}")
+        print(f"Error rate: {metrics['error_rate']:.2f}%")
+        print(f"Report saved to: {OUTPUT_EXCEL}")
+        
+        return self.results, metrics
+
+if __name__ == "__main__":
+    test = TestRunner()
+    results, metrics = test.run_test()
