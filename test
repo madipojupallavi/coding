@@ -1,107 +1,109 @@
 def generate_report(self, test_duration):
-    """Generate Excel report with comprehensive error rate calculations"""
+    """Generate Excel report with detailed failure analysis"""
     df = pd.DataFrame(self.results)
     
-    # Add URL columns
-    df['auth_url'] = URL_AUTH
-    df['process_id_url'] = URL_PROCESSING
-    df['api_url'] = df['process_id'].apply(lambda x: URL_API.format(processUid=x) if pd.notnull(x) else "N/A")
-    
-    # Classify error types
-    df['error_type'] = df.apply(lambda row: 
-        "ProcessID Generation Failed" if pd.isnull(row['process_id']) else
-        "API Call Failed" if not row['success'] else
-        "Success", axis=1)
-    
     # Calculate metrics
-    total_attempts = len(df)
-    success_count = len(df[df['error_type'] == "Success"])
-    pid_fail_count = len(df[df['error_type'] == "ProcessID Generation Failed"])
-    api_fail_count = len(df[df['error_type'] == "API Call Failed"])
+    success_count = df['success'].sum()
+    failure_count = len(df) - success_count
+    success_rate = (success_count / len(df)) * 100
+    error_rate = (failure_count / len(df)) * 100  # New error rate calculation
+    avg_response = df['response_time_sec'].mean()
     
-    # Calculate error rates
-    overall_error_rate = (pid_fail_count + api_fail_count) / total_attempts * 100
-    pid_error_rate = pid_fail_count / total_attempts * 100
-    api_error_rate = api_fail_count / total_attempts * 100
-    
-    # Create Excel file
+    # Create Excel file with sheets
     with pd.ExcelWriter(OUTPUT_EXCEL, engine='openpyxl') as writer:
-        # Main data sheet
+        # Sheet 1: Detailed Results
         df.to_excel(
             writer, 
-            sheet_name='Test Results', 
+            sheet_name='All Requests', 
             index=False,
             columns=[
                 "token_generation_time",
-                "auth_url",
-                "process_id",
-                "process_id_url",
-                "api_url",
+                "process_id", 
                 "api_status",
                 "response_time_sec",
-                "error_type",
-                "success"
+                "success",
+                "url"
             ]
         )
         
-        # Apply formatting
-        workbook = writer.book
-        sheet = workbook['Test Results']
+        # Sheet 2: Failed Requests (Detailed Analysis)
+        if not df[df['success'] == False].empty:
+            failed_df = df[df['success'] == False].copy()
+            failed_df['Failure Type'] = failed_df['api_status'].apply(
+                lambda x: 'HTTP Error' if str(x).isdigit() else 'Exception'
+            )
+            
+            failed_df.to_excel(
+                writer,
+                sheet_name='Failed Requests',
+                index=False,
+                columns=[
+                    "token_generation_time",
+                    "process_id",
+                    "url",
+                    "api_status",
+                    "response_time_sec",
+                    "Failure Type",
+                    "error_details"
+                ]
+            )
         
-        # Set column widths
-        col_widths = {
-            'A': 20, 'B': 35, 'C': 20, 'D': 40, 
-            'E': 40, 'F': 25, 'G': 15, 'H': 25, 'I': 10
+        # Sheet 3: Summary (Enhanced with error rate)
+        summary_data = {
+            'Metric': [
+                'Total Processes',
+                'Successful',
+                'Failed',
+                'Success Rate',
+                'Error Rate',  # New metric
+                'Average Response Time',
+                'Total Test Duration',
+                'First Failure',
+                'Last Failure'
+            ],
+            'Value': [
+                TOTAL_PROCESSES,
+                success_count,
+                failure_count,
+                f"{success_rate:.2f}%",
+                f"{error_rate:.2f}%",  # New value
+                f"{avg_response:.4f} sec",
+                f"{test_duration:.2f} sec",
+                df[df['success'] == False]['token_generation_time'].min() if not df[df['success'] == False].empty else 'N/A',
+                df[df['success'] == False]['token_generation_time'].max() if not df[df['success'] == False].empty else 'N/A'
+            ]
         }
-        for col, width in col_widths.items():
-            sheet.column_dimensions[col].width = width
+        pd.DataFrame(summary_data).to_excel(
+            writer, 
+            sheet_name='Summary', 
+            index=False
+        )
         
-        # Highlight errors
-        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-        for row in sheet.iter_rows(min_row=2, max_col=9, max_row=len(df)+1):
-            if row[7].value != "Success":  # 'error_type' column
-                for cell in row:
-                    cell.fill = red_fill
-        
-        # Add comprehensive error rate analysis
-        analysis_start = len(df) + 3
-        analysis_data = [
-            ["METRIC", "COUNT", "PERCENTAGE"],
-            ["Total Attempts", total_attempts, "100%"],
-            ["Successful Calls", success_count, f"{100 - overall_error_rate:.2f}%"],
-            ["Total Errors", pid_fail_count + api_fail_count, f"{overall_error_rate:.2f}%"],
-            ["", "", ""],
-            ["ProcessID Generation Errors", pid_fail_count, f"{pid_error_rate:.2f}%"],
-            ["API Call Errors", api_fail_count, f"{api_error_rate:.2f}%"],
-            ["", "", ""],
-            ["Success Rate (API Calls Only)", 
-             f"{success_count}/{success_count + api_fail_count}",
-             f"{success_count/(success_count + api_fail_count)*100:.2f}%"]
-        ]
-        
-        for i, row_data in enumerate(analysis_data, start=analysis_start):
-            for j, value in enumerate(row_data, start=1):
-                cell = sheet.cell(row=i, column=j, value=value)
-                if i == analysis_start:  # Header row
-                    cell.font = Font(bold=True)
-                elif j == 3 and i > analysis_start + 1:  # Percentage column
-                    cell.number_format = '0.00%'
-        
-        # Add error samples
-        if pid_fail_count > 0 or api_fail_count > 0:
-            sample_start = analysis_start + len(analysis_data) + 2
-            sheet.cell(row=sample_start, column=1, value="ERROR SAMPLES").font = Font(bold=True)
+        # Auto-adjust column widths and styling
+        workbook = writer.book
+        for sheetname in writer.sheets:
+            sheet = workbook[sheetname]
             
-            # Show ProcessID generation error samples
-            if pid_fail_count > 0:
-                pid_errors = df[df['error_type'] == "ProcessID Generation Failed"].head(3)
-                for i, (_, row) in enumerate(pid_errors.iterrows(), start=sample_start + 1):
-                    sheet.cell(row=i, column=1, value=f"ProcessID Error Sample {i-sample_start}:")
-                    sheet.cell(row=i, column=2, value=row.get('failure_details', 'Timeout'))
+            # Auto-width
+            for col in sheet.columns:
+                max_length = max(len(str(cell.value)) for cell in col)
+                sheet.column_dimensions[col[0].column_letter].width = max_length + 2
             
-            # Show API call error samples
-            if api_fail_count > 0:
-                api_errors = df[df['error_type'] == "API Call Failed"].head(3)
-                for i, (_, row) in enumerate(api_errors.iterrows(), start=sample_start + 4):
-                    sheet.cell(row=i, column=1, value=f"API Error Sample {i-sample_start-3}:")
-                    sheet.cell(row=i, column=2, value=row['api_status'])
+            # Highlight failures in red
+            if sheetname == 'All Requests':
+                red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+                for row in sheet.iter_rows(min_row=2, max_col=6, max_row=len(df)+1):
+                    if not row[4].value:  # 'Success' column
+                        for cell in row:
+                            cell.fill = red_fill
+
+        # Add failure statistics if any failures occurred
+        if not df[df['success'] == False].empty:
+            failure_stats = df[df['success'] == False]['api_status'].value_counts().reset_index()
+            failure_stats.columns = ['Error Type', 'Count']
+            failure_stats['Percentage'] = (failure_stats['Count'] / failure_count * 100).round(2).astype(str) + '%'
+            failure_stats.to_excel(
+                writer,
+                sheet_name='Failure Stats',
+                index=False
+            )
