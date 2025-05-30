@@ -74,8 +74,8 @@ def generate_report(self, test_duration, metrics):
             writer.book.active = 0
             
     except PermissionError:
-        print(f" ERROR: Could not save {OUTPUT_EXCEL} (file may be open in Excel)")
+        print(f"❌ ERROR: Could not save {OUTPUT_EXCEL} (file may be open in Excel)")
         raise
     except Exception as e:
-        print(f" Unexpected error saving report: {str(e)}")
+        print(f"❌ Unexpected error saving report: {str(e)}")
         raise
