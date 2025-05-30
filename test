@@ -1,360 +1,109 @@
-import sys
-import subprocess
-import time
-import statistics
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
-import requests
-import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import PatternFill
-from datetime import datetime
-requests.packages.urllib3.disable_warnings()
-
-# Configuration
-URL_AUTH = "https:///token"
-URL_PROCESSING = "https:///triggerMailBox"
-URL_API = "https:///profiles/{processUid}"
-USERNAME = ""
-PASSWORD = ""
-BODY = "t"
-PFX_PATH = ""
-PFX_PASSPHRASE = ""
-VERIFY_SSL = True
-
-# Test Configuration
-TOTAL_PROCESSES = 50  # Exact number of processes to test
-MAX_THREADS = 50      # Concurrent threads
-TOKEN_REFRESH_TIME = 20  # seconds
-OUTPUT_EXCEL = f"API_Test_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-
-def ensure_requests_pkcs12():
-    try:
-        import requests_pkcs12
-        return requests_pkcs12
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
-        import requests_pkcs12
-        return requests_pkcs12
-
-class TokenManager:
-    """Handles token generation and refresh"""
-    def __init__(self, requests_pkcs12):
-        self.requests_pkcs12 = requests_pkcs12
-        self.token = None
-        self.token_timestamp = 0
-        self.lock = threading.Lock()
+def generate_report(self, test_duration, metrics):
+    """Generate Excel report with full latency metrics and error breakdown"""
+    df_results = pd.DataFrame(self.results)
     
-    def get_token(self):
-        with self.lock:
-            current_time = time.time()
-            if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
-                self.token = self._fetch_new_token()
-                self.token_timestamp = current_time
-                print(f"New token generated at {datetime.fromtimestamp(current_time).strftime('%H:%M:%S')}")
-            return self.token
-    
-    def _fetch_new_token(self):
-        data = {"grant_type": "client_credentials"}
-        try:
-            response = self.requests_pkcs12.post(
-                URL_AUTH,
-                auth=(USERNAME, PASSWORD),
-                data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            response.raise_for_status()
-            return response.json().get("access_token")
-        except Exception as e:
-            print(f"Token generation failed: {str(e)}")
-            return None
+    with pd.ExcelWriter(OUTPUT_EXCEL, engine='openpyxl') as writer:
+        # --- Sheet 1: Detailed Results ---
+        df_results.to_excel(
+            writer,
+            sheet_name='Detailed Results',
+            index=False,
+            columns=[
+                "token_generation_time",
+                "process_id",
+                "api_status",
+                "response_time_sec",
+                "success",
+                "error_type"  # New column for error classification
+            ]
+        )
 
-class TestRunner:
-    def __init__(self):
-        self.requests_pkcs12 = ensure_requests_pkcs12()
-        self.token_manager = TokenManager(self.requests_pkcs12)
-        self.results = []
-        self.lock = threading.Lock()
-        
-    def generate_process_id(self, token):
-        """Generate processUid (GET)"""
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        try:
-            response = self.requests_pkcs12.get(
-                URL_PROCESSING,
-                headers=headers,
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            response.raise_for_status()
-            process_id = response.json().get("processUid")
-            print(f"Generated ProcessID: {process_id}")
-            return process_id
-        except Exception as e:
-            print(f"ProcessID generation failed: {str(e)}")
-            return None
-
-    def check_api_status(self, token, process_id):
-        """Check API status (GET)"""
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        try:
-            start_time = time.time()
-            response = self.requests_pkcs12.get(
-                URL_API.format(processUid=process_id),
-                headers=headers,
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            elapsed = time.time() - start_time
-            status = f"{response.status_code} {response.reason}"
-            return {
-                "status": status,
-                "response_time": elapsed,
-                "success": response.status_code == 200
-            }
-        except Exception as e:
-            return {
-                "status": f"Error: {str(e)}",
-                "response_time": 0,
-                "success": False
-            }
-
-    def worker(self):
-        """Single thread workflow"""
-        token = self.token_manager.get_token()
-        if not token:
-            return None
-            
-        process_id = self.generate_process_id(token)
-        if not process_id:
-            return None
-            
-        result = self.check_api_status(token, process_id)
-        
-        with self.lock:
-            self.results.append({
-                "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "process_id": process_id,
-                "api_status": result["status"],
-                "response_time_sec": result["response_time"],
-                "success": result["success"]
-            })
-        
-        print(f"Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
-        return result
-
-    def calculate_performance_metrics(self, test_duration):
-        """Calculate performance metrics"""
-        # Error Rate
-        total_processes = len(self.results)
-        failed_apis = sum(1 for result in self.results if not result['success'])
-        error_rate = (failed_apis / total_processes) * 100 if total_processes > 0 else 0
-
-        # Latency Metrics
-        response_times = [result['response_time_sec'] for result in self.results if result['success']]
-        avg_latency = statistics.mean(response_times) if response_times else 0
-        min_latency = min(response_times) if response_times else 0
-        max_latency = max(response_times) if response_times else 0
-        median_latency = statistics.median(response_times) if response_times else 0
-        p90_latency = statistics.quantiles(response_times, n=10)[8] if response_times else 0
-        p95_latency = statistics.quantiles(response_times, n=20)[18] if response_times else 0
-        std_dev_latency = statistics.stdev(response_times) if len(response_times) > 1 else 0
-
-        # Success/Failure Count
-        successful_apis = total_processes - failed_apis
-
-        # Throughput
-        throughput = total_processes / test_duration if test_duration > 0 else 0
-
-        # Token Refresh Frequency
-        token_times = sorted(set(result['token_generation_time'] for result in self.results))
-        refresh_count = len(token_times)
-
-        # Error Breakdown
-        error_types = {}
-        for result in self.results:
-            if not result['success']:
-                status = result['api_status']
-                error_types[status] = error_types.get(status, 0) + 1
-
-        # Response Time Distribution for Chart
-        bins = [0, 0.5, 1, 1.5, 2, 2.5, 3, float('inf')]
-        bin_labels = ["0-0.5s", "0.5-1s", "1-1.5s", "1.5-2s", "2-2.5s", "2.5-3s", ">3s"]
-        bin_counts = [
-            sum(1 for r in self.results if r['success'] and bins[i] <= r['response_time_sec'] < bins[i+1])
-            for i in range(len(bins)-1)
-        ]
-
-        return {
-            "successful_apis": successful_apis,
-            "failed_apis": failed_apis,
-            "error_rate": error_rate,
-            "avg_latency": avg_latency,
-            "min_latency": min_latency,
-            "max_latency": max_latency,
-            "median_latency": median_latency,
-            "p90_latency": p90_latency,
-            "p95_latency": p95_latency,
-            "std_dev_latency": std_dev_latency,
-            "throughput": throughput,
-            "refresh_count": refresh_count,
-            "error_types": error_types,
-            "total_duration": test_duration,
-            "response_time_distribution": {
-                "labels": bin_labels,
-                "counts": bin_counts
-            }
+        # --- Sheet 2: Summary (Full Metrics) ---
+        summary_data = {
+            'Metric': [
+                'Total Processes',
+                'Successful APIs',
+                'HTTP Failures (4xx/5xx)',
+                'Silent Failures (Crashes/Timeouts)',
+                'Error Rate',
+                'Average Response Time',
+                'Min Response Time',
+                'Max Response Time',
+                'Median Response Time',
+                '90th Percentile Response Time',
+                '95th Percentile Response Time',
+                'Std Dev Response Time',
+                'Total Test Duration',
+                'Throughput',
+                'Token Refresh Count'
+            ],
+            'Value': [
+                metrics["total_processes"],
+                metrics["successful_apis"],
+                metrics["http_failures"],
+                metrics["silent_failures"],
+                f"{metrics['error_rate']:.2f}%",
+                f"{metrics['avg_latency']:.4f} sec",
+                f"{metrics['min_latency']:.4f} sec",
+                f"{metrics['max_latency']:.4f} sec",
+                f"{metrics['median_latency']:.4f} sec",
+                f"{metrics['p90_latency']:.4f} sec",
+                f"{metrics['p95_latency']:.4f} sec",
+                f"{metrics['std_dev_latency']:.4f} sec",
+                f"{metrics['total_duration']:.2f} sec",
+                f"{metrics['throughput']:.2f} req/sec",
+                metrics["refresh_count"]
+            ]
         }
+        pd.DataFrame(summary_data).to_excel(
+            writer,
+            sheet_name='Summary',
+            index=False
+        )
 
-    def print_performance_metrics(self, metrics):
-        """Print performance metrics"""
-        print("\n=== Performance Test Summary ===")
-        print(f"Successful APIs: {metrics['successful_apis']}")
-        print(f"Failed APIs: {metrics['failed_apis']}")
-        print(f"Error Rate: {metrics['error_rate']:.2f}%")
-        print(f"Average Latency: {metrics['avg_latency']:.4f} sec")
-        print(f"Min Latency: {metrics['min_latency']:.4f} sec")
-        print(f"Max Latency: {metrics['max_latency']:.4f} sec")
-        print(f"Median Latency: {metrics['median_latency']:.4f} sec")
-        print(f"90th Percentile Latency: {metrics['p90_latency']:.4f} sec")
-        print(f"95th Percentile Latency: {metrics['p95_latency']:.4f} sec")
-        print(f"Standard Deviation of Latency: {metrics['std_dev_latency']:.4f} sec")
-        print(f"Total Test Duration: {metrics['total_duration']:.2f} sec")
-        print(f"Throughput: {metrics['throughput']:.2f} requests/sec")
-        print(f"Token Refresh Count: {metrics['refresh_count']}")
-        print(f"Error Breakdown: {metrics['error_types']}")
-        print("\nResponse Times by Process ID:")
-        print(f"{'Process ID':<20} {'Status':<20} {'Response Time (sec)':<20}")
-        print("-" * 60)
-        for result in self.results:
-            print(f"{result['process_id']:<20} {result['api_status']:<20} {result['response_time_sec']:<20.4f}")
-        print("\nResponse Time Distribution:")
-        for label, count in zip(metrics['response_time_distribution']['labels'], metrics['response_time_distribution']['counts']):
-            print(f"{label}: {count} requests")
+        # --- Sheet 3: Error Breakdown ---
+        error_types = {
+            "Error Type": list(metrics["error_types"].keys()) + ["Total"],
+            "Count": list(metrics["error_types"].values()) + [sum(metrics["error_types"].values())]
+        }
+        pd.DataFrame(error_types).to_excel(
+            writer,
+            sheet_name='Error Breakdown',
+            index=False
+        )
 
-    def generate_report(self, test_duration, metrics):
-        """Generate Excel report with detailed results and metrics"""
-        df = pd.DataFrame(self.results)
+        # --- Sheet 4: Response Time Distribution ---
+        dist_data = {
+            'Response Time Bin': metrics['response_time_distribution']['labels'],
+            'Request Count': metrics['response_time_distribution']['counts']
+        }
+        pd.DataFrame(dist_data).to_excel(
+            writer,
+            sheet_name='Response Time Distribution',
+            index=False
+        )
+
+        # --- Formatting ---
+        workbook = writer.book
         
-        with pd.ExcelWriter(OUTPUT_EXCEL, engine='openpyxl') as writer:
-            # Sheet 1: Detailed Results
-            df.to_excel(
-                writer, 
-                sheet_name='Detailed Results', 
-                index=False,
-                columns=[
-                    "token_generation_time",
-                    "process_id", 
-                    "api_status",
-                    "response_time_sec",
-                    "success"
-                ]
-            )
-            
-            # Sheet 2: Summary
-            summary_data = {
-                'Metric': [
-                    'Total Processes',
-                    'Successful APIs',
-                    'Failed APIs',
-                    'Error Rate',
-                    'Average Response Time',
-                    'Min Response Time',
-                    'Max Response Time',
-                    'Median Response Time',
-                    '90th Percentile Response Time',
-                    '95th Percentile Response Time',
-                    'Std Dev Response Time',
-                    'Total Test Duration',
-                    'Throughput',
-                    'Token Refresh Count'
-                ],
-                'Value': [
-                    TOTAL_PROCESSES,
-                    metrics['successful_apis'],
-                    metrics['failed_apis'],
-                    f"{metrics['error_rate']:.2f}%",
-                    f"{metrics['avg_latency']:.4f} sec",
-                    f"{metrics['min_latency']:.4f} sec",
-                    f"{metrics['max_latency']:.4f} sec",
-                    f"{metrics['median_latency']:.4f} sec",
-                    f"{metrics['p90_latency']:.4f} sec",
-                    f"{metrics['p95_latency']:.4f} sec",
-                    f"{metrics['std_dev_latency']:.4f} sec",
-                    f"{metrics['total_duration']:.2f} sec",
-                    f"{metrics['throughput']:.2f} req/sec",
-                    metrics['refresh_count']
-                ]
-            }
-            # Add Error Breakdown to Summary
-            if metrics['error_types']:
-                summary_data['Metric'].append('Error Breakdown')
-                summary_data['Value'].append(str(metrics['error_types']))
-            
-            pd.DataFrame(summary_data).to_excel(
-                writer, 
-                sheet_name='Summary', 
-                index=False
-            )
-            
-            # Sheet 3: Response Time Distribution
-            dist_data = {
-                'Response Time Bin': metrics['response_time_distribution']['labels'],
-                'Request Count': metrics['response_time_distribution']['counts']
-            }
-            pd.DataFrame(dist_data).to_excel(
-                writer,
-                sheet_name='Response Time Distribution',
-                index=False
-            )
-            
-            # Auto-adjust column widths
-            workbook = writer.book
-            for sheetname in writer.sheets:
-                sheet = workbook[sheetname]
-                for column in sheet.columns:
-                    max_length = max(
-                        len(str(cell.value)) for cell in column
-                    )
-                    sheet.column_dimensions[
-                        column[0].column_letter
-                    ].width = max_length + 2
-
-            # Add conditional formatting for failures in Detailed Results
-            sheet = workbook['Detailed Results']
-            red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-            for row in sheet.iter_rows(min_row=2, max_col=5, max_row=len(df)+1):
-                if not row[4].value:  # 'Success' column
-                    for cell in row:
-                        cell.fill = red_fill
-
-    def run_test(self):
-        """Execute test with multithreading"""
-        print(f"Starting test with {TOTAL_PROCESSES} processes using {MAX_THREADS} threads...")
-        start_time = time.time()
+        # Highlight failures in Detailed Results
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+        sheet = workbook['Detailed Results']
+        for row in sheet.iter_rows(min_row=2, max_col=6, max_row=len(df_results)+1):
+            if not row[4].value:  # 'success' column
+                for cell in row:
+                    cell.fill = red_fill
         
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            futures = [executor.submit(self.worker) for _ in range(TOTAL_PROCESSES)]
-            for future in as_completed(futures):
-                future.result()  # Wait for completion
-        
-        test_duration = time.time() - start_time
-        metrics = self.calculate_performance_metrics(test_duration)
-        self.generate_report(test_duration, metrics)
-        self.print_performance_metrics(metrics)
-        
-        print(f"\nTest completed. Report generated: {OUTPUT_EXCEL}")
-        return self.results, metrics
+        # Auto-adjust column widths
+        for sheetname in writer.sheets:
+            sheet = workbook[sheetname]
+            for column in sheet.columns:
+                max_length = max(len(str(cell.value)) for cell in column)
+                adjusted_width = (max_length + 2) * 1.2  # Extra padding
+                sheet.column_dimensions[column[0].column_letter].width = adjusted_width
 
-if __name__ == "__main__":
-    test = TestRunner()
-    results, metrics = test.run_test()
+        # Add bold headers
+        for sheetname in writer.sheets:
+            sheet = workbook[sheetname]
+            for cell in sheet[1]:  # Header row
+                cell.font = cell.font.copy(bold=True)
