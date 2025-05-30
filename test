@@ -4,15 +4,12 @@ import time
 import statistics
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import parse_qsl
 import json
 import requests
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.formatting.rule import CellIsRule
+from openpyxl.styles import PatternFill
 from datetime import datetime
-import numpy as np
 requests.packages.urllib3.disable_warnings()
 
 # Configuration
@@ -122,20 +119,17 @@ class TestRunner:
             return {
                 "status": status,
                 "response_time": elapsed,
-                "success": response.status_code == 200,
-                "status_code": response.status_code
+                "success": response.status_code == 200
             }
         except Exception as e:
             return {
                 "status": f"Error: {str(e)}",
                 "response_time": 0,
-                "success": False,
-                "status_code": 0
+                "success": False
             }
 
     def worker(self):
         """Single thread workflow"""
-        thread_start_time = time.time()
         token = self.token_manager.get_token()
         if not token:
             return None
@@ -145,295 +139,222 @@ class TestRunner:
             return None
             
         result = self.check_api_status(token, process_id)
-        total_time = time.time() - thread_start_time
         
         with self.lock:
             self.results.append({
-                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 "process_id": process_id,
                 "api_status": result["status"],
-                "status_code": result["status_code"],
                 "response_time_sec": result["response_time"],
-                "total_time_sec": total_time,
-                "success": result["success"],
-                "thread_id": threading.current_thread().ident
+                "success": result["success"]
             })
         
         print(f"Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
         return result
 
     def calculate_performance_metrics(self, test_duration):
-        """Calculate comprehensive performance metrics"""
-        df = pd.DataFrame(self.results)
-        
-        # Basic counts
-        total_requests = len(df)
-        successful_requests = df['success'].sum()
-        failed_requests = total_requests - successful_requests
-        
-        # Success/Error rates
-        success_rate = (successful_requests / total_requests) * 100 if total_requests > 0 else 0
-        error_rate = (failed_requests / total_requests) * 100 if total_requests > 0 else 0
-        
-        # Response time statistics
-        response_times = df['response_time_sec'].values
-        avg_response_time = np.mean(response_times)
-        median_response_time = np.median(response_times)
-        min_response_time = np.min(response_times)
-        max_response_time = np.max(response_times)
-        p95_response_time = np.percentile(response_times, 95)
-        p99_response_time = np.percentile(response_times, 99)
-        std_response_time = np.std(response_times)
-        
-        # Throughput calculations
-        requests_per_second = total_requests / test_duration if test_duration > 0 else 0
-        
-        # Performance rating based on response times and success rate
-        performance_score = self.calculate_performance_score(avg_response_time, success_rate, p95_response_time)
-        
+        """Calculate performance metrics"""
+        # Error Rate
+        total_processes = len(self.results)
+        failed_apis = sum(1 for result in self.results if not result['success'])
+        error_rate = (failed_apis / total_processes) * 100 if total_processes > 0 else 0
+
+        # Latency Metrics
+        response_times = [result['response_time_sec'] for result in self.results if result['success']]
+        avg_latency = statistics.mean(response_times) if response_times else 0
+        min_latency = min(response_times) if response_times else 0
+        max_latency = max(response_times) if response_times else 0
+        median_latency = statistics.median(response_times) if response_times else 0
+        p90_latency = statistics.quantiles(response_times, n=10)[8] if response_times else 0
+        p95_latency = statistics.quantiles(response_times, n=20)[18] if response_times else 0
+        std_dev_latency = statistics.stdev(response_times) if len(response_times) > 1 else 0
+
+        # Success/Failure Count
+        successful_apis = total_processes - failed_apis
+
+        # Throughput
+        throughput = total_processes / test_duration if test_duration > 0 else 0
+
+        # Token Refresh Frequency
+        token_times = sorted(set(result['token_generation_time'] for result in self.results))
+        refresh_count = len(token_times)
+
+        # Error Breakdown
+        error_types = {}
+        for result in self.results:
+            if not result['success']:
+                status = result['api_status']
+                error_types[status] = error_types.get(status, 0) + 1
+
+        # Response Time Distribution for Chart
+        bins = [0, 0.5, 1, 1.5, 2, 2.5, 3, float('inf')]
+        bin_labels = ["0-0.5s", "0.5-1s", "1-1.5s", "1.5-2s", "2-2.5s", "2.5-3s", ">3s"]
+        bin_counts = [
+            sum(1 for r in self.results if r['success'] and bins[i] <= r['response_time_sec'] < bins[i+1])
+            for i in range(len(bins)-1)
+        ]
+
         return {
-            'total_requests': total_requests,
-            'successful_requests': successful_requests,
-            'failed_requests': failed_requests,
-            'success_rate': success_rate,
-            'error_rate': error_rate,
-            'avg_response_time': avg_response_time,
-            'median_response_time': median_response_time,
-            'min_response_time': min_response_time,
-            'max_response_time': max_response_time,
-            'p95_response_time': p95_response_time,
-            'p99_response_time': p99_response_time,
-            'std_response_time': std_response_time,
-            'requests_per_second': requests_per_second,
-            'test_duration': test_duration,
-            'performance_score': performance_score
+            "successful_apis": successful_apis,
+            "failed_apis": failed_apis,
+            "error_rate": error_rate,
+            "avg_latency": avg_latency,
+            "min_latency": min_latency,
+            "max_latency": max_latency,
+            "median_latency": median_latency,
+            "p90_latency": p90_latency,
+            "p95_latency": p95_latency,
+            "std_dev_latency": std_dev_latency,
+            "throughput": throughput,
+            "refresh_count": refresh_count,
+            "error_types": error_types,
+            "total_duration": test_duration,
+            "response_time_distribution": {
+                "labels": bin_labels,
+                "counts": bin_counts
+            }
         }
 
-    def calculate_performance_score(self, avg_response_time, success_rate, p95_response_time):
-        """Calculate overall performance score (0-100)"""
-        # Weight factors
-        success_weight = 0.4  # 40% weight for success rate
-        speed_weight = 0.4    # 40% weight for average response time
-        consistency_weight = 0.2  # 20% weight for P95 response time
-        
-        # Success rate score (0-100)
-        success_score = success_rate
-        
-        # Speed score (inverse relationship - lower response time = higher score)
-        # Assuming good response time is < 1s, acceptable is < 3s, poor is > 5s
-        if avg_response_time <= 1:
-            speed_score = 100
-        elif avg_response_time <= 3:
-            speed_score = 100 - ((avg_response_time - 1) / 2) * 50  # Linear decrease from 100 to 50
-        elif avg_response_time <= 5:
-            speed_score = 50 - ((avg_response_time - 3) / 2) * 30   # Linear decrease from 50 to 20
-        else:
-            speed_score = max(0, 20 - (avg_response_time - 5) * 5)  # Rapid decrease below 20
-        
-        # Consistency score based on P95
-        if p95_response_time <= 2:
-            consistency_score = 100
-        elif p95_response_time <= 5:
-            consistency_score = 100 - ((p95_response_time - 2) / 3) * 50
-        else:
-            consistency_score = max(0, 50 - (p95_response_time - 5) * 10)
-        
-        # Overall score
-        overall_score = (success_score * success_weight + 
-                        speed_score * speed_weight + 
-                        consistency_score * consistency_weight)
-        
-        return round(overall_score, 2)
+    def print_performance_metrics(self, metrics):
+        """Print performance metrics"""
+        print("\n=== Performance Test Summary ===")
+        print(f"Successful APIs: {metrics['successful_apis']}")
+        print(f"Failed APIs: {metrics['failed_apis']}")
+        print(f"Error Rate: {metrics['error_rate']:.2f}%")
+        print(f"Average Latency: {metrics['avg_latency']:.4f} sec")
+        print(f"Min Latency: {metrics['min_latency']:.4f} sec")
+        print(f"Max Latency: {metrics['max_latency']:.4f} sec")
+        print(f"Median Latency: {metrics['median_latency']:.4f} sec")
+        print(f"90th Percentile Latency: {metrics['p90_latency']:.4f} sec")
+        print(f"95th Percentile Latency: {metrics['p95_latency']:.4f} sec")
+        print(f"Standard Deviation of Latency: {metrics['std_dev_latency']:.4f} sec")
+        print(f"Total Test Duration: {metrics['total_duration']:.2f} sec")
+        print(f"Throughput: {metrics['throughput']:.2f} requests/sec")
+        print(f"Token Refresh Count: {metrics['refresh_count']}")
+        print(f"Error Breakdown: {metrics['error_types']}")
+        print("\nResponse Times by Process ID:")
+        print(f"{'Process ID':<20} {'Status':<20} {'Response Time (sec)':<20}")
+        print("-" * 60)
+        for result in self.results:
+            print(f"{result['process_id']:<20} {result['api_status']:<20} {result['response_time_sec']:<20.4f}")
+        print("\nResponse Time Distribution:")
+        for label, count in zip(metrics['response_time_distribution']['labels'], metrics['response_time_distribution']['counts']):
+            print(f"{label}: {count} requests")
 
-    def get_performance_rating(self, score):
-        """Get performance rating based on score"""
-        if score >= 90:
-            return "Excellent"
-        elif score >= 75:
-            return "Good"
-        elif score >= 60:
-            return "Fair"
-        elif score >= 40:
-            return "Poor"
-        else:
-            return "Critical"
-
-    def generate_report(self, test_duration):
-        """Generate comprehensive Excel report with performance metrics"""
+    def generate_report(self, test_duration, metrics):
+        """Generate Excel report with detailed results and metrics"""
         df = pd.DataFrame(self.results)
-        metrics = self.calculate_performance_metrics(test_duration)
         
-        # Create Excel file with multiple sheets
         with pd.ExcelWriter(OUTPUT_EXCEL, engine='openpyxl') as writer:
-            # Sheet 1: Performance Summary
+            # Sheet 1: Detailed Results
+            df.to_excel(
+                writer, 
+                sheet_name='Detailed Results', 
+                index=False,
+                columns=[
+                    "token_generation_time",
+                    "process_id", 
+                    "api_status",
+                    "response_time_sec",
+                    "success"
+                ]
+            )
+            
+            # Sheet 2: Summary
             summary_data = {
-                'Performance Metric': [
-                    'Overall Performance Score',
-                    'Performance Rating',
-                    'Total API Requests',
-                    'Successful Requests',
-                    'Failed Requests',
-                    'Success Rate (%)',
-                    'Error Rate (%)',
-                    'Average Response Time (sec)',
-                    'Median Response Time (sec)',
-                    'Min Response Time (sec)',
-                    'Max Response Time (sec)',
-                    '95th Percentile Response Time (sec)',
-                    '99th Percentile Response Time (sec)',
-                    'Response Time Std Deviation',
-                    'Requests Per Second',
-                    'Total Test Duration (sec)',
-                    'Concurrent Threads Used'
+                'Metric': [
+                    'Total Processes',
+                    'Successful APIs',
+                    'Failed APIs',
+                    'Error Rate',
+                    'Average Response Time',
+                    'Min Response Time',
+                    'Max Response Time',
+                    'Median Response Time',
+                    '90th Percentile Response Time',
+                    '95th Percentile Response Time',
+                    'Std Dev Response Time',
+                    'Total Test Duration',
+                    'Throughput',
+                    'Token Refresh Count'
                 ],
                 'Value': [
-                    f"{metrics['performance_score']}/100",
-                    self.get_performance_rating(metrics['performance_score']),
-                    metrics['total_requests'],
-                    metrics['successful_requests'],
-                    metrics['failed_requests'],
-                    f"{metrics['success_rate']:.2f}%",
+                    TOTAL_PROCESSES,
+                    metrics['successful_apis'],
+                    metrics['failed_apis'],
                     f"{metrics['error_rate']:.2f}%",
-                    f"{metrics['avg_response_time']:.4f}",
-                    f"{metrics['median_response_time']:.4f}",
-                    f"{metrics['min_response_time']:.4f}",
-                    f"{metrics['max_response_time']:.4f}",
-                    f"{metrics['p95_response_time']:.4f}",
-                    f"{metrics['p99_response_time']:.4f}",
-                    f"{metrics['std_response_time']:.4f}",
-                    f"{metrics['requests_per_second']:.2f}",
-                    f"{metrics['test_duration']:.2f}",
-                    MAX_THREADS
+                    f"{metrics['avg_latency']:.4f} sec",
+                    f"{metrics['min_latency']:.4f} sec",
+                    f"{metrics['max_latency']:.4f} sec",
+                    f"{metrics['median_latency']:.4f} sec",
+                    f"{metrics['p90_latency']:.4f} sec",
+                    f"{metrics['p95_latency']:.4f} sec",
+                    f"{metrics['std_dev_latency']:.4f} sec",
+                    f"{metrics['total_duration']:.2f} sec",
+                    f"{metrics['throughput']:.2f} req/sec",
+                    metrics['refresh_count']
                 ]
             }
-            pd.DataFrame(summary_data).to_excel(writer, sheet_name='Performance Summary', index=False)
+            # Add Error Breakdown to Summary
+            if metrics['error_types']:
+                summary_data['Metric'].append('Error Breakdown')
+                summary_data['Value'].append(str(metrics['error_types']))
             
-            # Sheet 2: Successful APIs
-            successful_df = df[df['success'] == True].copy()
-            if not successful_df.empty:
-                successful_df = successful_df.sort_values('response_time_sec')
-                successful_df.to_excel(writer, sheet_name='Successful APIs', index=False)
+            pd.DataFrame(summary_data).to_excel(
+                writer, 
+                sheet_name='Summary', 
+                index=False
+            )
             
-            # Sheet 3: Failed APIs
-            failed_df = df[df['success'] == False].copy()
-            if not failed_df.empty:
-                failed_df = failed_df.sort_values('timestamp')
-                failed_df.to_excel(writer, sheet_name='Failed APIs', index=False)
+            # Sheet 3: Response Time Distribution
+            dist_data = {
+                'Response Time Bin': metrics['response_time_distribution']['labels'],
+                'Request Count': metrics['response_time_distribution']['counts']
+            }
+            pd.DataFrame(dist_data).to_excel(
+                writer,
+                sheet_name='Response Time Distribution',
+                index=False
+            )
             
-            # Sheet 4: Detailed Results (All)
-            df_sorted = df.sort_values('timestamp')
-            df_sorted.to_excel(writer, sheet_name='All API Results', index=False)
-            
-            # Sheet 5: Response Time Analysis
-            response_time_analysis = pd.DataFrame({
-                'Response Time Range (sec)': ['0 - 1', '1 - 2', '2 - 3', '3 - 5', '> 5'],
-                'Count': [
-                    len(df[(df['response_time_sec'] >= 0) & (df['response_time_sec'] < 1)]),
-                    len(df[(df['response_time_sec'] >= 1) & (df['response_time_sec'] < 2)]),
-                    len(df[(df['response_time_sec'] >= 2) & (df['response_time_sec'] < 3)]),
-                    len(df[(df['response_time_sec'] >= 3) & (df['response_time_sec'] < 5)]),
-                    len(df[df['response_time_sec'] >= 5])
-                ]
-            })
-            response_time_analysis['Percentage'] = (response_time_analysis['Count'] / len(df) * 100).round(2)
-            response_time_analysis.to_excel(writer, sheet_name='Response Time Analysis', index=False)
-            
-            # Apply formatting
-            self.format_excel_sheets(writer, metrics)
+            # Auto-adjust column widths
+            workbook = writer.book
+            for sheetname in writer.sheets:
+                sheet = workbook[sheetname]
+                for column in sheet.columns:
+                    max_length = max(
+                        len(str(cell.value)) for cell in column
+                    )
+                    sheet.column_dimensions[
+                        column[0].column_letter
+                    ].width = max_length + 2
 
-        print(f"\n{'='*60}")
-        print("PERFORMANCE TEST RESULTS SUMMARY")
-        print(f"{'='*60}")
-        print(f"Overall Performance Score: {metrics['performance_score']}/100 ({self.get_performance_rating(metrics['performance_score'])})")
-        print(f"Success Rate: {metrics['success_rate']:.2f}% ({metrics['successful_requests']}/{metrics['total_requests']})")
-        print(f"Error Rate: {metrics['error_rate']:.2f}% ({metrics['failed_requests']}/{metrics['total_requests']})")
-        print(f"Average Response Time: {metrics['avg_response_time']:.4f} seconds")
-        print(f"95th Percentile Response Time: {metrics['p95_response_time']:.4f} seconds")
-        print(f"Throughput: {metrics['requests_per_second']:.2f} requests/second")
-        print(f"Test Duration: {metrics['test_duration']:.2f} seconds")
-        print(f"Report Generated: {OUTPUT_EXCEL}")
-        print(f"{'='*60}")
-
-    def format_excel_sheets(self, writer, metrics):
-        """Apply formatting to Excel sheets"""
-        workbook = writer.book
-        
-        # Format Performance Summary sheet
-        if 'Performance Summary' in workbook.sheetnames:
-            ws = workbook['Performance Summary']
-            
-            # Header formatting
-            for cell in ws[1]:
-                cell.font = Font(bold=True)
-                cell.alignment = Alignment(horizontal='center')
-            
-            # Color code performance score
-            score_cell = ws['B2']  # Performance score cell
-            score = metrics['performance_score']
-            if score >= 90:
-                score_cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")  # Green
-            elif score >= 75:
-                score_cell.fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")  # Yellow
-            elif score >= 60:
-                score_cell.fill = PatternFill(start_color="FFD2A6", end_color="FFD2A6", fill_type="solid")  # Orange
-            else:
-                score_cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")  # Red
-        
-        # Auto-adjust column widths for all sheets
-        for sheetname in workbook.sheetnames:
-            ws = workbook[sheetname]
-            for column in ws.columns:
-                max_length = 0
-                column_letter = column[0].column_letter
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = min(max_length + 2, 50)  # Cap at 50
-                ws.column_dimensions[column_letter].width = adjusted_width
-        
-        # Apply conditional formatting to failed APIs
-        if 'All API Results' in workbook.sheetnames:
-            ws = workbook['All API Results']
+            # Add conditional formatting for failures in Detailed Results
+            sheet = workbook['Detailed Results']
             red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-            
-            # Find the success column
-            success_col = None
-            for i, cell in enumerate(ws[1], 1):
-                if cell.value == 'success':
-                    success_col = i
-                    break
-            
-            if success_col:
-                for row in range(2, ws.max_row + 1):
-                    if not ws.cell(row=row, column=success_col).value:  # If success is False
-                        for col in range(1, ws.max_column + 1):
-                            ws.cell(row=row, column=col).fill = red_fill
+            for row in sheet.iter_rows(min_row=2, max_col=5, max_row=len(df)+1):
+                if not row[4].value:  # 'Success' column
+                    for cell in row:
+                        cell.fill = red_fill
 
     def run_test(self):
         """Execute test with multithreading"""
-        print(f"Starting API Performance Test...")
-        print(f"Configuration: {TOTAL_PROCESSES} processes, {MAX_THREADS} threads")
-        print(f"{'='*60}")
-        
+        print(f"Starting test with {TOTAL_PROCESSES} processes using {MAX_THREADS} threads...")
         start_time = time.time()
         
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             futures = [executor.submit(self.worker) for _ in range(TOTAL_PROCESSES)]
-            completed = 0
             for future in as_completed(futures):
-                future.result()
-                completed += 1
-                if completed % 10 == 0:  # Progress update every 10 completions
-                    print(f"Progress: {completed}/{TOTAL_PROCESSES} completed")
+                future.result()  # Wait for completion
         
         test_duration = time.time() - start_time
-        self.generate_report(test_duration)
+        metrics = self.calculate_performance_metrics(test_duration)
+        self.generate_report(test_duration, metrics)
+        self.print_performance_metrics(metrics)
         
-        return self.results
+        print(f"\nTest completed. Report generated: {OUTPUT_EXCEL}")
+        return self.results, metrics
 
 if __name__ == "__main__":
     test = TestRunner()
-    results = test.run_test()
+    results, metrics = test.run_test()
