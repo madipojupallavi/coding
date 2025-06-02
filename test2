@@ -1,4 +1,214 @@
-we need to write a quotation from a caprter to pvt company 
-reagarding a frame work building 
-fro a single frame (wood name is ghana teakwood) size 48 inchs x 36 inchs  rate per each rs.2653
-in 2653 we are charging imported ghana teakwood +labour+nails+fivecols+extra raw materials + )
+json api validation
+import sys
+import subprocess
+import time
+import json
+import requests
+from datetime import datetime
+
+# Configuration
+URL_AUTH = "https:///token"
+URL_PROCESSING = "https:///triggerMailBox"
+URL_API = "https:///profiles/{processUid}"
+USERNAME = ""
+PASSWORD = ""
+BODY = "t"
+PFX_PATH = ""
+PFX_PASSPHRASE = ""
+VERIFY_SSL = True
+
+# Test Configuration
+TOTAL_PROCESSES = 50
+TOKEN_REFRESH_TIME = 20  # seconds
+
+# Expected tool order
+EXPECTED_ORDER = [
+    "download_documents",
+    "classify_documents",
+    "pre_intake_extract",
+    "party_intake",
+    "web_search",
+    "document_extract",
+    "scratchpad",
+    "screening",
+    "aggregate_cip_data",
+    "aggregate_cdd_data",
+    "calculate_crr",
+    "kyc_ingestion"
+]
+
+def ensure_requests_pkcs12():
+    try:
+        import requests_pkcs12
+        return requests_pkcs12
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
+        import requests_pkcs12
+        return requests_pkcs12
+
+def find_tools(data):
+    tools = []
+    if 'content' in data and 'intermediate_sourcing' in data['content']:
+        intermediate_sourcing = data['content']['intermediate_sourcing']
+        
+        for item in intermediate_sourcing:
+            if isinstance(item, str) and 'tool=' in item:
+                tool_start_index = item.find('tool=') + 6
+                tool_end_index = item.find("'", tool_start_index)
+                
+                if tool_start_index != -1 and tool_end_index != -1:
+                    tool = item[tool_start_index:tool_end_index]
+                    tools.append(tool)
+    return tools
+
+def compare_tools(tools, expected_order):
+    expected_tools = [tool.replace("_", " ") for tool in expected_order]
+    tools = [tool.replace("_", " ") for tool in tools]
+    return tools == expected_tools
+
+def find_status(data):
+    if 'content' in data and 'intermediate_sourcing' in data['content']:
+        intermediate_sourcing = data['content']['intermediate_sourcing']
+        
+        for item in intermediate_sourcing:
+            if isinstance(item, str) and 'tool=' in item and 'log=' in item:
+                log_start_index = item.find('log=') + 5
+                log_end_index = item.find("'", log_start_index)
+                
+                if log_start_index != -1 and log_end_index != -1:
+                    log_json_str = item[log_start_index:log_end_index]
+                    
+                    try:
+                        log_json = json.loads(log_json_str)
+                        if 'status' in log_json and log_json['status'] == 'Success':
+                            return True
+                    except json.JSONDecodeError:
+                        continue
+    return False
+
+class TestRunner:
+    def __init__(self):
+        self.requests_pkcs12 = ensure_requests_pkcs12()
+        self.token = None
+        self.token_timestamp = 0
+        self.refresh_counter = 0
+        self.completed_processes = 0
+    
+    def _fetch_new_token(self):
+        data = {"grant_type": "client_credentials"}
+        try:
+            response = self.requests_pkcs12.post(
+                URL_AUTH,
+                auth=(USERNAME, PASSWORD),
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json().get("access_token")
+        except Exception as e:
+            print(f"Token generation failed: {str(e)}")
+            return None
+
+    def get_token(self):
+        current_time = time.time()
+        if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
+            self.token = self._fetch_new_token()
+            self.token_timestamp = current_time
+            self.refresh_counter += 1
+            print(f"New token generated (Total refreshes: {self.refresh_counter})")
+        return self.token
+    
+    def generate_process_id(self, token):
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            response = self.requests_pkcs12.get(
+                URL_PROCESSING,
+                headers=headers,
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json().get("processUid")
+        except Exception as e:
+            print(f"ProcessID generation failed: {str(e)}")
+            return None
+
+    def check_api_status(self, token, process_id):
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        try:
+            start_time = time.time()
+            response = self.requests_pkcs12.get(
+                URL_API.format(processUid=process_id),
+                headers=headers,
+                pkcs12_filename=PFX_PATH,
+                pkcs12_password=PFX_PASSPHRASE,
+                verify=VERIFY_SSL,
+                timeout=30
+            )
+            elapsed = time.time() - start_time
+            return {
+                "status": f"{response.status_code} {response.reason}",
+                "response_time": elapsed,
+                "json_response": response.json() if response.status_code == 200 else None
+            }
+        except Exception as e:
+            return {
+                "status": f"Error: {str(e)}",
+                "response_time": 0,
+                "json_response": None
+            }
+
+    def run_test(self):
+        print(f"🚀 Starting test with {TOTAL_PROCESSES} processes in single-threaded mode...")
+        start_time = time.time()
+        
+        for _ in range(TOTAL_PROCESSES):
+            try:
+                token = self.get_token()
+                if not token:
+                    raise ValueError("Token generation failed")
+                
+                process_id = self.generate_process_id(token)
+                if not process_id:
+                    raise ValueError("Process ID generation failed")
+                
+                result = self.check_api_status(token, process_id)
+                
+                self.completed_processes += 1
+                print(f"[{self.completed_processes}/{TOTAL_PROCESSES}] Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
+                
+                if result["json_response"]:
+                    print(f"JSON Response: {json.dumps(result['json_response'], indent=2)}")
+                    
+                    # Check status
+                    has_success = find_status(result["json_response"])
+                    print(f"Status Check: {'Success' if has_success else 'Failed'}")
+                    
+                    # Check tool sequence
+                    tools = find_tools(result["json_response"])
+                    correct_order = compare_tools(tools, EXPECTED_ORDER)
+                    print(f"Tools Found: {tools}")
+                    print(f"Tool Sequence Check: {'PASS' if correct_order else 'FAIL'} - {'Order correct' if correct_order else 'Order issues found'}")
+                    
+                    # Overall result
+                    overall_result = has_success and correct_order
+                    print(f"Overall Result: {'PASS' if overall_result else 'FAIL'}")
+                
+            except Exception as e:
+                self.completed_processes += 1
+                print(f"[{self.completed_processes}/{TOTAL_PROCESSES}] Failed: {str(e)}")
+        
+        test_duration = time.time() - start_time
+        print("\n=== TEST COMPLETE ===")
+        print(f"Total duration: {test_duration:.2f}s")
+        print(f"Total token refreshes: {self.refresh_counter}")
+
+if __name__ == "__main__":
+    test = TestRunner()
+    test.run_test()
