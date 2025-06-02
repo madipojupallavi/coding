@@ -1,4 +1,3 @@
-json api validation
 import sys
 import subprocess
 import time
@@ -183,10 +182,10 @@ class TestRunner:
                 self.completed_processes += 1
                 print(f"[{self.completed_processes}/{TOTAL_PROCESSES}] Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
                 
-                if result["json_response"]:
+                if result["status"] == "200 OK" and result["json_response"]:
                     print(f"JSON Response: {json.dumps(result['json_response'], indent=2)}")
                     
-                    # Check status
+                    # Check status in intermediate_sourcing
                     has_success = find_status(result["json_response"])
                     print(f"Status Check: {'Success' if has_success else 'Failed'}")
                     
@@ -199,6 +198,10 @@ class TestRunner:
                     # Overall result
                     overall_result = has_success and correct_order
                     print(f"Overall Result: {'PASS' if overall_result else 'FAIL'}")
+                else:
+                    print("Status Check: Skipped (HTTP status not 200 OK)")
+                    print("Tool Sequence Check: Skipped (HTTP status not 200 OK)")
+                    print("Overall Result: FAIL")
                 
             except Exception as e:
                 self.completed_processes += 1
