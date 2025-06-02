@@ -144,7 +144,7 @@ class TestRunner:
     def generate_process_id(self, token):
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         try:
-            response = self.requests_pkcs12.get(
+            response = self.requests_pkcs12.post(
                 URL_PROCESSING,
                 headers=headers,
                 pkcs12_filename=PFX_PATH,
@@ -164,6 +164,10 @@ class TestRunner:
         elapsed = 0
         
         while elapsed < POLLING_TIMEOUT:
+            # Refresh token if needed before making the API call
+            current_token = self.get_token()
+            headers["Authorization"] = f"Bearer {current_token}"
+            
             try:
                 response = self.requests_pkcs12.get(
                     URL_API.format(processUid=process_id),
