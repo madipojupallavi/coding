@@ -18,6 +18,8 @@ VERIFY_SSL = True
 
 # Test Configuration
 TOKEN_REFRESH_TIME = 20  # seconds
+POLLING_TIMEOUT = 300  # seconds (5 minutes)
+POLLING_INTERVAL = 5  # seconds
 
 # Expected tool order
 EXPECTED_ORDER = [
@@ -84,6 +86,26 @@ def find_status(data):
                         continue
     return False
 
+def find_status_completed(data):
+    if 'content' in data and 'intermediate_sourcing' in data['content']:
+        intermediate_sourcing = data['content']['intermediate_sourcing']
+        
+        for item in intermediate_sourcing:
+            if isinstance(item, str) and 'tool=' in item and 'log=' in item:
+                log_start_index = item.find('log=') + 5
+                log_end_index = item.find("'", log_start_index)
+                
+                if log_start_index != -1 and log_end_index != -1:
+                    log_json_str = item[log_start_index:log_end_index]
+                    
+                    try:
+                        log_json = json.loads(log_json_str)
+                        if 'status' in log_json and log_json['status'] == 'Completed':
+                            return True
+                    except json.JSONDecodeError:
+                        continue
+    return False
+
 class TestRunner:
     def __init__(self):
         self.requests_pkcs12 = ensure_requests_pkcs12()
@@ -101,8 +123,7 @@ class TestRunner:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 pkcs12_filename=PFX_PATH,
                 pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
+                verify=VERIFY_SSLoccupazione: "timeout=30
             )
             response.raise_for_status()
             return response.json().get("access_token")
@@ -138,28 +159,47 @@ class TestRunner:
 
     def check_api_status(self, token, process_id):
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        try:
-            start_time = time.time()
-            response = self.requests_pkcs12.get(
-                URL_API.format(processUid=process_id),
-                headers=headers,
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            elapsed = time.time() - start_time
-            return {
-                "status": f"{response.status_code} {response.reason}",
-                "response_time": elapsed,
-                "json_response": response.json() if response.status_code == 200 else None
-            }
-        except Exception as e:
-            return {
-                "status": f"Error: {str(e)}",
-                "response_time": 0,
-                "json_response": None
-            }
+        start_time = time.time()
+        elapsed = 0
+        
+        while elapsed < POLLING_TIMEOUT:
+            try:
+                response = self.requests_pkcs12.get(
+                    URL_API.format(processUid=process_id),
+                    headers=headers,
+                    pkcs12_filename=PFX_PATH,
+                    pkcs12_password=PFX_PASSPHRASE,
+                    verify=VERIFY_SSL,
+                    timeout=30
+                )
+                current_time = time.time()
+                elapsed = current_time - start_time
+                
+                if response.status_code == 200:
+                    json_response = response.json()
+                    if find_status_completed(json_response):
+                        return {
+                            "status": f"{response.status_code} {response.reason}",
+                            "response_time": elapsed,
+                            "json_response": json_response
+                        }
+                    else:
+                        print(f"Status not Completed, retrying in {POLLING_INTERVAL}s (Elapsed: {elapsed:.2f}s)")
+                else:
+                    print(f"Non-200 response: {response.status_code} {response.reason}, retrying in {POLLING_INTERVAL}s")
+                
+                time.sleep(POLLING_INTERVAL)
+                
+            except Exception as e:
+                print(f"API call failed: {str(e)}, retrying in {POLLING_INTERVAL}s")
+                time.sleep(POLLING_INTERVAL)
+                elapsed = time.time() - start_time
+        
+        return {
+            "status": "Error: Timeout waiting for Completed status",
+            "response_time": elapsed,
+            "json_response": None
+        }
 
     def run_test(self):
         print("🚀 Starting test for a single process...")
@@ -195,8 +235,8 @@ class TestRunner:
                 overall_result = has_success and correct_order
                 print(f"Overall Result: {'PASS' if overall_result else 'FAIL'}")
             else:
-                print("Status Check: Skipped (HTTP status not 200 OK)")
-                print("Tool Sequence Check: Skipped (HTTP status not 200 OK)")
+                print("Status Check: Skipped (HTTP status not 200 OK or timeout)")
+                print("Tool Sequence Check: Skipped (HTTP status not 200 OK or timeout)")
                 print("Overall Result: FAIL")
             
         except Exception as e:
