@@ -17,7 +17,6 @@ PFX_PASSPHRASE = ""
 VERIFY_SSL = True
 
 # Test Configuration
-TOTAL_PROCESSES = 50
 TOKEN_REFRESH_TIME = 20  # seconds
 
 # Expected tool order
@@ -91,7 +90,6 @@ class TestRunner:
         self.token = None
         self.token_timestamp = 0
         self.refresh_counter = 0
-        self.completed_processes = 0
     
     def _fetch_new_token(self):
         data = {"grant_type": "client_credentials"}
@@ -164,48 +162,45 @@ class TestRunner:
             }
 
     def run_test(self):
-        print(f"🚀 Starting test with {TOTAL_PROCESSES} processes in single-threaded mode...")
+        print("🚀 Starting test for a single process...")
         start_time = time.time()
         
-        for _ in range(TOTAL_PROCESSES):
-            try:
-                token = self.get_token()
-                if not token:
-                    raise ValueError("Token generation failed")
+        try:
+            token = self.get_token()
+            if not token:
+                raise ValueError("Token generation failed")
+            
+            process_id = self.generate_process_id(token)
+            if not process_id:
+                raise ValueError("Process ID generation failed")
+            
+            result = self.check_api_status(token, process_id)
+            
+            print(f"Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
+            
+            if result["status"] == "200 OK" and result["json_response"]:
+                print(f"JSON Response: {json.dumps(result['json_response'], indent=2)}")
                 
-                process_id = self.generate_process_id(token)
-                if not process_id:
-                    raise ValueError("Process ID generation failed")
+                # Check status in intermediate_sourcing
+                has_success = find_status(result["json_response"])
+                print(f"Status Check: {'Success' if has_success else 'Failed'}")
                 
-                result = self.check_api_status(token, process_id)
+                # Check tool sequence
+                tools = find_tools(result["json_response"])
+                correct_order = compare_tools(tools, EXPECTED_ORDER)
+                print(f"Tools Found: {tools}")
+                print(f"Tool Sequence Check: {'PASS' if correct_order else 'FAIL'} - {'Order correct' if correct_order else 'Order issues found'}")
                 
-                self.completed_processes += 1
-                print(f"[{self.completed_processes}/{TOTAL_PROCESSES}] Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
-                
-                if result["status"] == "200 OK" and result["json_response"]:
-                    print(f"JSON Response: {json.dumps(result['json_response'], indent=2)}")
-                    
-                    # Check status in intermediate_sourcing
-                    has_success = find_status(result["json_response"])
-                    print(f"Status Check: {'Success' if has_success else 'Failed'}")
-                    
-                    # Check tool sequence
-                    tools = find_tools(result["json_response"])
-                    correct_order = compare_tools(tools, EXPECTED_ORDER)
-                    print(f"Tools Found: {tools}")
-                    print(f"Tool Sequence Check: {'PASS' if correct_order else 'FAIL'} - {'Order correct' if correct_order else 'Order issues found'}")
-                    
-                    # Overall result
-                    overall_result = has_success and correct_order
-                    print(f"Overall Result: {'PASS' if overall_result else 'FAIL'}")
-                else:
-                    print("Status Check: Skipped (HTTP status not 200 OK)")
-                    print("Tool Sequence Check: Skipped (HTTP status not 200 OK)")
-                    print("Overall Result: FAIL")
-                
-            except Exception as e:
-                self.completed_processes += 1
-                print(f"[{self.completed_processes}/{TOTAL_PROCESSES}] Failed: {str(e)}")
+                # Overall result
+                overall_result = has_success and correct_order
+                print(f"Overall Result: {'PASS' if overall_result else 'FAIL'}")
+            else:
+                print("Status Check: Skipped (HTTP status not 200 OK)")
+                print("Tool Sequence Check: Skipped (HTTP status not 200 OK)")
+                print("Overall Result: FAIL")
+            
+        except Exception as e:
+            print(f"Failed: {str(e)}")
         
         test_duration = time.time() - start_time
         print("\n=== TEST COMPLETE ===")
