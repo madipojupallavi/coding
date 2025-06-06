@@ -1,105 +1,29 @@
-def run_dynamic_test(self):
-    print(f"🚀 Starting dynamic test for {TEST_DURATION} seconds using {MAX_THREADS} threads...")
-    start_time = time.time()
-    end_time = start_time + TEST_DURATION
-    self.completed_processes = 0  # Reset counter
+def _fetch_new_token(self):
+    print("DEBUG: Inside _fetch_new_token")  # <-- Add this
+    data = {"grant_type": "client_credentials"}
+    stats = {
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "success": False,
+        "response_time": 0,
+        "request_size_bytes": 0,
+        "response_size_bytes": 0,
+        "error": None
+    }
     
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        futures = []
-        while time.time() < end_time:
-            futures.append(executor.submit(self.worker))
-            # Small sleep to prevent overwhelming the queue
-            time.sleep(0.01)
-        
-        # Cancel any pending futures that haven't started
-        for future in futures:
-            if not future.running():
-                future.cancel()
-        
-        # Wait only for the futures that were started before end_time
-        for future in as_completed([f for f in futures if not f.cancelled()]):
-            future.result()
-    
-    actual_duration = time.time() - start_time
-    print(f"Actual test duration: {actual_duration:.2f}s")
-    self.generate_report(TEST_DURATION)  # Use the intended duration for metrics
-    
-    print("\n=== DYNAMIC TEST COMPLETE ===")
-    print(f"Total duration: {actual_duration:.2f}s")
-    print(f"Total processes completed: {len(self.results)}")
-    print(f"Tokens generated: {self.token_manager.total_tokens_generated}")
-    print(f"Process IDs generated: {len(self.processing_stats)}")
-    print(f"API calls made: {len(self.api_stats)}")
-    print(f"Report saved to: {OUTPUT_EXCEL}")
-    
-    return self.results
-
-class TokenManager:
-    def __init__(self, requests_pkcs12):
-        self.requests_pkcs12 = requests_pkcs12
-        self.token = None
-        self.token_timestamp = 0
-        self.lock = threading.Lock()
-        self.refresh_counter = 0
-        self.total_tokens_generated = 0
-        self.new_token_event = threading.Event()  # Add this line
-    
-    def get_token(self):
-        with self.lock:
-            current_time = time.time()
-            if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
-                # Signal that we're getting a new token
-                self.new_token_event.clear()
-                
-                self.token = self._fetch_new_token()
-                self.token_timestamp = current_time
-                self.refresh_counter += 1
-                self.total_tokens_generated += 1
-                
-                # Signal that new token is ready
-                self.new_token_event.set()
-                print(f"New token generated (Total refreshes: {self.refresh_counter})")
-            return self.token
-    
-    def wait_for_new_token(self):
-        """Wait for the next token refresh if one is imminent"""
-        next_refresh = self.token_timestamp + TOKEN_REFRESH_TIME
-        time_until_refresh = next_refresh - time.time()
-        
-        if time_until_refresh <= 1.0:  # If refresh is due within 1 second
-            self.new_token_event.wait()  # Wait for new token
-
-def worker(self):
     try:
-        # Wait for fresh token if refresh is imminent
-        self.token_manager.wait_for_new_token()
+        print("DEBUG: Making HTTP POST request...")  # <-- Add this
+        start_time = time.time()
+        response = self.requests_pkcs12.post(
+            URL_AUTH,
+            auth=(USERNAME, PASSWORD),
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            pkcs12_filename=PFX_PATH,
+            pkcs12_password=PFX_PASSPHRASE,
+            verify=VERIFY_SSL,
+            timeout=10  # <<< ADD TIMEOUT (CRITICAL)
+        )
+        elapsed = time.time() - start_time
+        print("DEBUG: HTTP request completed!")  # <-- Add this
         
-        token_result = self.token_manager.get_token()
-        if not token_result or not token_result["token"]:
-            raise ValueError("Token generation failed")
-            
-        process_id = self.generate_process_id(token_result["token"])
-        if not process_id:
-            raise ValueError("Process ID generation failed")
-            
-        result = self.check_api_status(token_result["token"], process_id)
-        
-        with self.lock:
-            self.completed_processes += 1
-            self.results.append({
-                "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "process_id": process_id,
-                "api_status": result["status"],
-                "response_time_sec": result["response_time"],
-                "success": result["success"],
-                "error_type": None if result["success"] else "HTTP",
-                "final_status": result["final_status"],
-                "request_size_bytes": result["request_size_bytes"],
-                "response_size_bytes": result["response_size_bytes"]
-            })
-            print(f"[{self.completed_processes}] Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
-            
-        return result
-    except Exception as e:
-        # ... (keep existing error handling)
-
+        # Rest of the code...
