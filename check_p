@@ -1,166 +1,105 @@
-def check_api_status(self, token, process_id):
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    try:
-        start_time = time.time()
-        response = self.requests_pkcs12.get(
-            URL_API.format(processUid=process_id),
-            headers=headers,
-            pkcs12_filename=PFX_PATH,
-            pkcs12_password=PFX_PASSPHRASE,
-            verify=VERIFY_SSL,
-            timeout=30
-        )
-        elapsed = time.time() - start_time
+def run_dynamic_test(self):
+    print(f"🚀 Starting dynamic test for {TEST_DURATION} seconds using {MAX_THREADS} threads...")
+    start_time = time.time()
+    end_time = start_time + TEST_DURATION
+    self.completed_processes = 0  # Reset counter
+    
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        futures = []
+        while time.time() < end_time:
+            futures.append(executor.submit(self.worker))
+            # Small sleep to prevent overwhelming the queue
+            time.sleep(0.01)
         
-        # Calculate request/response sizes
-        request_size = len(str(headers)) + len(URL_API.format(processUid=process_id))
-        response_size = len(response.text)
+        # Cancel any pending futures that haven't started
+        for future in futures:
+            if not future.running():
+                future.cancel()
         
-        # First check if response is 200 OK
-        if response.status_code != 200:
-            with self.lock:
-                self.api_stats.append({
-                    "process_id": process_id,
-                    "response_time": elapsed,
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size,
-                    "success": False,
-                    "error": f"{response.status_code} {response.reason}",
-                    "final_status": "HTTP Error"
-                })
-            return {
-                "status": f"{response.status_code} {response.reason}",
-                "response_time": elapsed,
-                "success": False,
-                "final_status": "HTTP Error",
-                "request_size_bytes": request_size,
-                "response_size_bytes": response_size
-            }
-        
-        # If 200 OK, check the JSON response for status in content
-        try:
-            response_json = response.json()
-            content_status = response_json.get("content", {}).get("status", "Unknown")
-            
-            # If status is not Completed, poll until it is or max attempts reached
-            if content_status != "Completed":
-                attempts = 1
-                while attempts < MAX_STATUS_CHECKS and content_status != "Completed":
-                    time.sleep(STATUS_CHECK_INTERVAL)
-                    check_start = time.time()
-                    response = self.requests_pkcs12.get(
-                        URL_API.format(processUid=process_id),
-                        headers=headers,
-                        pkcs12_filename=PFX_PATH,
-                        pkcs12_password=PFX_PASSPHRASE,
-                        verify=VERIFY_SSL,
-                        timeout=30
-                    )
-                    check_elapsed = time.time() - check_start
-                    elapsed += check_elapsed  # Accumulate all check times
-                    
-                    # Accumulate request/response sizes
-                    request_size += len(str(headers)) + len(URL_API.format(processUid=process_id))
-                    response_size += len(response.text)
-                    
-                    if response.status_code != 200:
-                        with self.lock:
-                            self.api_stats.append({
-                                "process_id": process_id,
-                                "response_time": elapsed,
-                                "request_size_bytes": request_size,
-                                "response_size_bytes": response_size,
-                                "success": False,
-                                "error": f"Status check failed: {response.status_code} {response.reason}",
-                                "final_status": "HTTP Error during polling"
-                            })
-                        return {
-                            "status": f"Status check failed: {response.status_code} {response.reason}",
-                            "response_time": elapsed,
-                            "success": False,
-                            "final_status": "HTTP Error during polling",
-                            "request_size_bytes": request_size,
-                            "response_size_bytes": response_size
-                        }
-                    
-                    response_json = response.json()
-                    content_status = response_json.get("content", {}).get("status", "Unknown")
-                    attempts += 1
-            
-            if content_status == "Completed":
-                with self.lock:
-                    self.api_stats.append({
-                        "process_id": process_id,
-                        "response_time": elapsed,
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size,
-                        "success": True,
-                        "final_status": "Completed"
-                    })
-                return {
-                    "status": f"200 OK - Completed",
-                    "response_time": elapsed,
-                    "success": True,
-                    "final_status": "Completed",
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size
-                }
-            else:
-                with self.lock:
-                    self.api_stats.append({
-                        "process_id": process_id,
-                        "response_time": elapsed,
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size,
-                        "success": False,
-                        "error": f"Final status: {content_status} (after {attempts} checks)",
-                        "final_status": f"Timeout - {content_status}"
-                    })
-                return {
-                    "status": f"200 OK - Final status: {content_status} (after {attempts} checks)",
-                    "response_time": elapsed,
-                    "success": False,
-                    "final_status": f"Timeout - {content_status}",
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size
-                }
-                
-        except ValueError:  # JSON decode error
-            with self.lock:
-                self.api_stats.append({
-                    "process_id": process_id,
-                    "response_time": elapsed,
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size,
-                    "success": False,
-                    "error": "Invalid JSON response",
-                    "final_status": "Invalid JSON"
-                })
-            return {
-                "status": "200 OK - Invalid JSON response",
-                "response_time": elapsed,
-                "success": False,
-                "final_status": "Invalid JSON",
-                "request_size_bytes": request_size,
-                "response_size_bytes": response_size
-            }
-            
-    except Exception as e:
+        # Wait only for the futures that were started before end_time
+        for future in as_completed([f for f in futures if not f.cancelled()]):
+            future.result()
+    
+    actual_duration = time.time() - start_time
+    print(f"Actual test duration: {actual_duration:.2f}s")
+    self.generate_report(TEST_DURATION)  # Use the intended duration for metrics
+    
+    print("\n=== DYNAMIC TEST COMPLETE ===")
+    print(f"Total duration: {actual_duration:.2f}s")
+    print(f"Total processes completed: {len(self.results)}")
+    print(f"Tokens generated: {self.token_manager.total_tokens_generated}")
+    print(f"Process IDs generated: {len(self.processing_stats)}")
+    print(f"API calls made: {len(self.api_stats)}")
+    print(f"Report saved to: {OUTPUT_EXCEL}")
+    
+    return self.results
+
+class TokenManager:
+    def __init__(self, requests_pkcs12):
+        self.requests_pkcs12 = requests_pkcs12
+        self.token = None
+        self.token_timestamp = 0
+        self.lock = threading.Lock()
+        self.refresh_counter = 0
+        self.total_tokens_generated = 0
+        self.new_token_event = threading.Event()  # Add this line
+    
+    def get_token(self):
         with self.lock:
-            self.api_stats.append({
+            current_time = time.time()
+            if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
+                # Signal that we're getting a new token
+                self.new_token_event.clear()
+                
+                self.token = self._fetch_new_token()
+                self.token_timestamp = current_time
+                self.refresh_counter += 1
+                self.total_tokens_generated += 1
+                
+                # Signal that new token is ready
+                self.new_token_event.set()
+                print(f"New token generated (Total refreshes: {self.refresh_counter})")
+            return self.token
+    
+    def wait_for_new_token(self):
+        """Wait for the next token refresh if one is imminent"""
+        next_refresh = self.token_timestamp + TOKEN_REFRESH_TIME
+        time_until_refresh = next_refresh - time.time()
+        
+        if time_until_refresh <= 1.0:  # If refresh is due within 1 second
+            self.new_token_event.wait()  # Wait for new token
+
+def worker(self):
+    try:
+        # Wait for fresh token if refresh is imminent
+        self.token_manager.wait_for_new_token()
+        
+        token_result = self.token_manager.get_token()
+        if not token_result or not token_result["token"]:
+            raise ValueError("Token generation failed")
+            
+        process_id = self.generate_process_id(token_result["token"])
+        if not process_id:
+            raise ValueError("Process ID generation failed")
+            
+        result = self.check_api_status(token_result["token"], process_id)
+        
+        with self.lock:
+            self.completed_processes += 1
+            self.results.append({
+                "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 "process_id": process_id,
-                "response_time": 0,
-                "request_size_bytes": 0,
-                "response_size_bytes": 0,
-                "success": False,
-                "error": str(e),
-                "final_status": f"Exception: {str(e)}"
+                "api_status": result["status"],
+                "response_time_sec": result["response_time"],
+                "success": result["success"],
+                "error_type": None if result["success"] else "HTTP",
+                "final_status": result["final_status"],
+                "request_size_bytes": result["request_size_bytes"],
+                "response_size_bytes": result["response_size_bytes"]
             })
-        return {
-            "status": f"Error: {str(e)}",
-            "response_time": 0,
-            "success": False,
-            "final_status": f"Exception: {str(e)}",
-            "request_size_bytes": 0,
-            "response_size_bytes": 0
-        }
+            print(f"[{self.completed_processes}] Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
+            
+        return result
+    except Exception as e:
+        # ... (keep existing error handling)
+
