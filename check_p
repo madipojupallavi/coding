@@ -55,29 +55,28 @@ class TokenManager:
         self.lock = threading.Lock()
         self.refresh_counter = 0
         self.total_tokens_generated = 0
-        self.token_stats = []  # Initialize token_stats list
-        self.test_active = True  # Flag to control token generation
+        self.token_stats = []  # Store token generation metrics
     
     def get_token(self):
         with self.lock:
-            if not self.test_active:
-                return None  # Prevent token generation after test ends
             current_time = time.time()
             if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
                 token_result = self._fetch_new_token()
-                self.token = token_result["token"]
-                self.token_timestamp = current_time
-                self.refresh_counter += 1
-                self.total_tokens_generated += 1
-                self.token_stats.append({
-                    "response_time": token_result["response_time"],
-                    "request_size_bytes": token_result["request_size_bytes"],
-                    "response_size_bytes": token_result["response_size_bytes"],
-                    "success": token_result["success"],
-                    "error": token_result.get("error", None)
-                })
-                print(f"New token generated (Total refreshes: {self.refresh_counter})")
-            return self.token
+                if token_result["success"]:
+                    self.token = token_result["token"]
+                    self.token_timestamp = current_time
+                    self.refresh_counter += 1
+                    self.total_tokens_generated += 1
+                    print(f"New token generated (Total refreshes: {self.refresh_counter})")
+                return token_result
+            return {
+                "token": self.token,
+                "response_time": 0,
+                "request_size_bytes": 0,
+                "response_size_bytes": 0,
+                "success": True,
+                "from_cache": True
+            }
     
     def _fetch_new_token(self):
         data = {"grant_type": "client_credentials"}
@@ -94,33 +93,40 @@ class TokenManager:
                 timeout=30
             )
             elapsed = time.time() - start_time
-            response.raise_for_status()
             
             # Calculate request/response sizes
             request_size = len(str(data)) + len(URL_AUTH) + len(USERNAME) + len(PASSWORD)
             response_size = len(response.text)
             
-            return {
-                "token": response.json().get("access_token"),
+            response.raise_for_status()
+            token_data = response.json()
+            
+            # Record the token generation metrics
+            token_result = {
+                "token": token_data.get("access_token"),
                 "response_time": elapsed,
                 "request_size_bytes": request_size,
                 "response_size_bytes": response_size,
-                "success": True
+                "success": True,
+                "from_cache": False
             }
+            
+            self.token_stats.append(token_result)
+            return token_result
+            
         except Exception as e:
-            print(f"Token generation failed: {str(e)}")
-            return {
+            error_result = {
                 "token": None,
                 "response_time": 0,
                 "request_size_bytes": 0,
                 "response_size_bytes": 0,
                 "success": False,
-                "error": str(e)
+                "error": str(e),
+                "from_cache": False
             }
-    
-    def stop(self):
-        with self.lock:
-            self.test_active = False  # Signal to stop token generation
+            self.token_stats.append(error_result)
+            print(f"Token generation failed: {str(e)}")
+            return error_result
 
 class TestRunner:
     def __init__(self):
@@ -133,8 +139,6 @@ class TestRunner:
         self.completed_processes = 0
         
     def generate_process_id(self, token):
-        if not token:
-            return None
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         try:
             start_time = time.time()
@@ -179,15 +183,6 @@ class TestRunner:
             return None
 
     def check_api_status(self, token, process_id):
-        if not token or not process_id:
-            return {
-                "status": "Error: Invalid token or process_id",
-                "response_time": 0,
-                "success": False,
-                "final_status": "Invalid Input",
-                "request_size_bytes": 0,
-                "response_size_bytes": 0
-            }
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         try:
             start_time = time.time()
@@ -356,32 +351,34 @@ class TestRunner:
 
     def worker(self):
         try:
-            token = self.token_manager.get_token()
-            if not token:
-                raise ValueError("Token generation failed or test stopped")
+            token_result = self.token_manager.get_token()
+            if not token_result or not token_result["token"]:
+                raise ValueError("Token generation failed")
                 
-            process_id = self.generate_process_id(token)
+            process_id = self.generate_process_id(token_result["token"])
             if not process_id:
                 raise ValueError("Process ID generation failed")
                 
-            result = self.check_api_status(token, process_id)
+            api_result = self.check_api_status(token_result["token"], process_id)
             
             with self.lock:
                 self.completed_processes += 1
                 self.results.append({
                     "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     "process_id": process_id,
-                    "api_status": result["status"],
-                    "response_time_sec": result["response_time"],
-                    "success": result["success"],
-                    "error_type": None if result["success"] else "HTTP",
-                    "final_status": result["final_status"],
-                    "request_size_bytes": result["request_size_bytes"],
-                    "response_size_bytes": result["response_size_bytes"]
+                    "api_status": api_result["status"],
+                    "response_time_sec": api_result["response_time"],
+                    "success": api_result["success"],
+                    "error_type": None if api_result["success"] else "HTTP",
+                    "final_status": api_result["final_status"],
+                    "request_size_bytes": api_result["request_size_bytes"],
+                    "response_size_bytes": api_result["response_size_bytes"],
+                    "token_response_time": token_result["response_time"],
+                    "token_success": token_result["success"]
                 })
-                print(f"[{self.completed_processes}] Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
+                print(f"[{self.completed_processes}] Process {process_id}: {api_result['status']} ({api_result['response_time']:.2f}s)")
                 
-            return result
+            return api_result
             
         except Exception as e:
             with self.lock:
@@ -395,14 +392,16 @@ class TestRunner:
                     "error_type": "SILENT",
                     "final_status": f"Crash: {str(e)}",
                     "request_size_bytes": 0,
-                    "response_size_bytes": 0
+                    "response_size_bytes": 0,
+                    "token_response_time": 0,
+                    "token_success": False
                 })
             print(f"⚠️ Worker failed: {str(e)}")
             return None
 
     def calculate_metrics(self, data, time_field, size_field=None):
-        success_data = [d for d in data if d["success"]]
-        success_times = [d[time_field] for d in success_data]
+        success_data = [d for d in data if d.get("success", False)]
+        success_times = [d[time_field] for d in success_data if time_field in d]
         
         metrics = {
             "count": len(data),
@@ -419,8 +418,8 @@ class TestRunner:
         }
         
         if size_field:
-            total_request_size = sum(d["request_size_bytes"] for d in data)
-            total_response_size = sum(d["response_size_bytes"] for d in data)
+            total_request_size = sum(d.get("request_size_bytes", 0) for d in data)
+            total_response_size = sum(d.get("response_size_bytes", 0) for d in data)
             metrics.update({
                 "total_request_kb": total_request_size / 1024,
                 "total_response_kb": total_response_size / 1024,
@@ -441,9 +440,9 @@ class TestRunner:
             
             # Calculate throughput and KB/sec for each endpoint
             for metrics in [token_metrics, processing_metrics, api_metrics]:
-                metrics["throughput"] = metrics["count"] / test_duration if test_duration > 0 else 0
-                metrics["received_kb_sec"] = metrics["total_response_kb"] / test_duration if test_duration > 0 else 0
-                metrics["sent_kb_sec"] = metrics["total_request_kb"] / test_duration if test_duration > 0 else 0
+                metrics["throughput"] = metrics["count"] / test_duration
+                metrics["received_kb_sec"] = metrics["total_response_kb"] / test_duration
+                metrics["sent_kb_sec"] = metrics["total_request_kb"] / test_duration
 
             # Create a new Excel workbook with single sheet for all metrics
             wb = Workbook()
@@ -495,7 +494,7 @@ class TestRunner:
             # Add summary section
             ws.append([])  # Empty row
             ws.append(["Test Summary"])
-            ws.append(["Test Duration (seconds)", f"{test_duration:.2f}"])
+            ws.append(["Test Duration (seconds)", test_duration])
             ws.append(["Total Threads", MAX_THREADS])
             ws.append(["Total Tokens Generated", self.token_manager.total_tokens_generated])
             ws.append(["Total Process IDs Generated", len(self.processing_stats)])
@@ -503,7 +502,7 @@ class TestRunner:
             ws.append(["Total Successful Transactions", len([r for r in self.results if r["success"]])])
             ws.append(["Total Failed Transactions", len([r for r in self.results if not r["success"]])])
             ws.append(["Overall Error Rate", f"{((len(self.results) - len([r for r in self.results if r['success']])) / len(self.results) * 100 if len(self.results) > 0 else 0):.2f}%"])
-            ws.append(["Overall Throughput (requests/sec)", f"{len(self.results) / test_duration:.2f}" if test_duration > 0 else "0.00"])
+            ws.append(["Overall Throughput (requests/sec)", f"{len(self.results) / test_duration:.2f}"])
             
             # Formatting
             for col in ws.columns:
@@ -546,31 +545,27 @@ class TestRunner:
         end_time = start_time + TEST_DURATION
         self.completed_processes = 0  # Reset counter
         
+        # Create an event to signal threads to stop
+        stop_event = threading.Event()
+        
+        def worker_wrapper():
+            while not stop_event.is_set() and time.time() < end_time:
+                self.worker()
+        
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            futures = []
-            try:
-                # Submit tasks only while test duration is not exceeded
-                while time.time() < end_time:
-                    if len(futures) < MAX_THREADS:  # Limit concurrent tasks
-                        futures.append(executor.submit(self.worker))
-                    time.sleep(0.1)  # Increased sleep to prevent overwhelming the queue
-                
-                # Signal to stop token generation
-                self.token_manager.stop()
-                
-                # Wait for all submitted tasks to complete or timeout
-                timeout = max(0, end_time - time.time() + 5)  # Allow 5 seconds grace period
-                for future in as_completed(futures, timeout=timeout):
-                    try:
-                        future.result(timeout=timeout)
-                    except TimeoutError:
-                        print("⚠️ Task timed out and was cancelled")
-                        continue
-                
-            finally:
-                # Ensure executor shuts down to prevent new tasks
-                executor.shutdown(wait=False)
-                print("Executor shutdown initiated")
+            # Submit initial batch of workers
+            futures = [executor.submit(worker_wrapper) for _ in range(MAX_THREADS)]
+            
+            # Wait until test duration expires
+            while time.time() < end_time:
+                time.sleep(0.1)
+            
+            # Signal all workers to stop
+            stop_event.set()
+            
+            # Wait for all threads to complete current work
+            for future in futures:
+                future.cancel()
         
         test_duration = time.time() - start_time
         self.generate_report(test_duration)
@@ -584,7 +579,7 @@ class TestRunner:
         print(f"Report saved to: {OUTPUT_EXCEL}")
         
         return self.results
-
-if __name__ == "__main__":
+    
+    if __name__ == "__main__":
     test = TestRunner()
     results = test.run_dynamic_test()
