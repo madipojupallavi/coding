@@ -1,19 +1,15 @@
 import sys
 import subprocess
 import time
-import statistics
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import requests
-import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Font
-from openpyxl.utils import get_column_letter
+import threading
+import queue
+import statistics
 from datetime import datetime
-from pathlib import Path
-import os
-import math
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configuration
 URL_AUTH = "https:///token"
@@ -25,62 +21,37 @@ BODY = "t"
 PFX_PATH = ""
 PFX_PASSPHRASE = ""
 VERIFY_SSL = True
+OUTPUT_EXCEL = f"performance_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
 # Test Configuration
-MAX_THREADS = 50    # concurrent threads (one flow per thread)
 TOKEN_REFRESH_TIME = 20  # seconds
-MAX_STATUS_CHECKS = 10  # Maximum number of times to check for "Completed" status
-STATUS_CHECK_INTERVAL = 2  # Seconds between status checks
-
-# Output Configuration
-OUTPUT_DIR = Path.cwd() / "performance_results"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_EXCEL = OUTPUT_DIR / f"API_Performance_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-
-def ensure_requests_pkcs12():
-    try:
-        import requests_pkcs12
-        return requests_pkcs12
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
-        import requests_pkcs12
-        return requests_pkcs12
+POLLING_TIMEOUT = 300  # seconds (5 minutes)
+POLLING_INTERVAL = 5  # seconds
+MAX_THREADS = 50  # Number of concurrent threads
 
 class TokenManager:
-    def __init__(self, requests_pkcs12):
-        self.requests_pkcs12 = requests_pkcs12
+    def __init__(self):
+        self.requests_pkcs12 = self._ensure_requests_pkcs12()
         self.token = None
         self.token_timestamp = 0
-        self.lock = threading.Lock()
         self.refresh_counter = 0
+        self.token_stats = []  # Track token generation metrics
         self.total_tokens_generated = 0
-        self.token_stats = []  # Store token generation metrics
-    
-    def get_token(self):
-        with self.lock:
-            current_time = time.time()
-            if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
-                token_result = self._fetch_new_token()
-                if token_result["success"]:
-                    self.token = token_result["token"]
-                    self.token_timestamp = current_time
-                    self.refresh_counter += 1
-                    self.total_tokens_generated += 1
-                    print(f"New token generated (Total refreshes: {self.refresh_counter})")
-                return token_result
-            return {
-                "token": self.token,
-                "response_time": 0,
-                "request_size_bytes": 0,
-                "response_size_bytes": 0,
-                "success": True,
-                "from_cache": True
-            }
-    
+        self.lock = threading.Lock()
+
+    def _ensure_requests_pkcs12(self):
+        try:
+            import requests_pkcs12
+            return requests_pkcs12
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
+            import requests_pkcs12
+            return requests_pkcs12
+
     def _fetch_new_token(self):
+        start_time = time.time()
         data = {"grant_type": "client_credentials"}
         try:
-            start_time = time.time()
             response = self.requests_pkcs12.post(
                 URL_AUTH,
                 auth=(USERNAME, PASSWORD),
@@ -91,59 +62,65 @@ class TokenManager:
                 verify=VERIFY_SSL,
                 timeout=30
             )
+            response.raise_for_status()
             elapsed = time.time() - start_time
             
-            # Calculate request/response sizes
-            request_size = len(str(data)) + len(URL_AUTH) + len(USERNAME) + len(PASSWORD)
-            response_size = len(response.text)
+            with self.lock:
+                self.token_stats.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "response_time": elapsed,
+                    "http_status": f"{response.status_code} {response.reason}",
+                    "success": True,
+                    "request_size_bytes": len(str(data)),
+                    "response_size_bytes": len(response.text)
+                })
+                self.total_tokens_generated += 1
             
-            response.raise_for_status()
-            token_data = response.json()
-            
-            # Record the token generation metrics
-            token_result = {
-                "token": token_data.get("access_token"),
-                "response_time": elapsed,
-                "request_size_bytes": request_size,
-                "response_size_bytes": response_size,
-                "success": True,
-                "from_cache": False
-            }
-            
-            self.token_stats.append(token_result)
-            return token_result
-            
+            return response.json().get("access_token")
         except Exception as e:
-            error_result = {
-                "token": None,
-                "response_time": 0,
-                "request_size_bytes": 0,
-                "response_size_bytes": 0,
-                "success": False,
-                "error": str(e),
-                "from_cache": False
-            }
-            self.token_stats.append(error_result)
+            elapsed = time.time() - start_time
+            with self.lock:
+                self.token_stats.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "response_time": elapsed,
+                    "http_status": str(e),
+                    "success": False,
+                    "request_size_bytes": len(str(data)),
+                    "response_size_bytes": 0
+                })
             print(f"Token generation failed: {str(e)}")
-            return error_result
+            return None
+
+    def get_token(self):
+        current_time = time.time()
+        if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
+            new_token = self._fetch_new_token()
+            if new_token:
+                with self.lock:
+                    self.token = new_token
+                    self.token_timestamp = current_time
+                    self.refresh_counter += 1
+                    print(f"New token generated (Total refreshes: {self.refresh_counter})")
+        return self.token
 
 class TestRunner:
     def __init__(self):
-        self.requests_pkcs12 = ensure_requests_pkcs12()
-        self.token_manager = TokenManager(self.requests_pkcs12)
-        self.results = []
+        self.token_manager = TokenManager()
         self.processing_stats = []
         self.api_stats = []
+        self.results = []
         self.lock = threading.Lock()
-        self.completed_processes = 0
-        self.start_time = None
-        self.end_time = None
-        
-    def generate_process_id(self, token):
+        self.queue = queue.Queue()
+
+    def generate_process_id(self):
+        token = self.token_manager.get_token()
+        if not token:
+            return None
+
+        start_time = time.time()
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         try:
-            start_time = time.time()
-            response = self.requests_pkcs12.get(
+            response = self.token_manager.requests_pkcs12.post(
                 URL_PROCESSING,
                 headers=headers,
                 pkcs12_filename=PFX_PATH,
@@ -151,269 +128,147 @@ class TestRunner:
                 verify=VERIFY_SSL,
                 timeout=30
             )
+            response.raise_for_status()
             elapsed = time.time() - start_time
             
-            # Calculate request/response sizes
-            request_size = len(str(headers)) + len(URL_PROCESSING)
-            response_size = len(response.text)
-            
-            response.raise_for_status()
-            process_id = response.json().get("processUid")
-            
             with self.lock:
                 self.processing_stats.append({
-                    "process_id": process_id,
+                    "timestamp": datetime.now().isoformat(),
                     "response_time": elapsed,
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size,
-                    "success": True
+                    "http_status": f"{response.status_code} {response.reason}",
+                    "success": True,
+                    "request_size_bytes": len(BODY),
+                    "response_size_bytes": len(response.text)
                 })
             
-            return process_id
+            return response.json().get("processUid")
         except Exception as e:
+            elapsed = time.time() - start_time
             with self.lock:
                 self.processing_stats.append({
-                    "process_id": None,
-                    "response_time": 0,
-                    "request_size_bytes": 0,
-                    "response_size_bytes": 0,
+                    "timestamp": datetime.now().isoformat(),
+                    "response_time": elapsed,
+                    "http_status": str(e),
                     "success": False,
-                    "error": str(e)
+                    "request_size_bytes": len(BODY),
+                    "response_size_bytes": 0
                 })
             print(f"ProcessID generation failed: {str(e)}")
             return None
 
-    def check_api_status(self, token, process_id):
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        try:
-            start_time = time.time()
-            response = self.requests_pkcs12.get(
-                URL_API.format(processUid=process_id),
-                headers=headers,
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            elapsed = time.time() - start_time
+    def check_api_status(self, process_id):
+        start_time = time.time()
+        elapsed = 0
+        api_calls = 0
+        success = False
+        final_status = "Timeout"
+        
+        while elapsed < POLLING_TIMEOUT:
+            token = self.token_manager.get_token()
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
             
-            # Calculate request/response sizes
-            request_size = len(str(headers)) + len(URL_API.format(processUid=process_id))
-            response_size = len(response.text)
-            
-            # First check if response is 200 OK
-            if response.status_code != 200:
+            try:
+                call_start = time.time()
+                response = self.token_manager.requests_pkcs12.get(
+                    URL_API.format(processUid=process_id),
+                    headers=headers,
+                    pkcs12_filename=PFX_PATH,
+                    pkcs12_password=PFX_PASSPHRASE,
+                    verify=VERIFY_SSL,
+                    timeout=30
+                )
+                call_elapsed = time.time() - call_start
+                api_calls += 1
+                current_time = time.time()
+                elapsed = current_time - start_time
+                
                 with self.lock:
                     self.api_stats.append({
+                        "timestamp": datetime.now().isoformat(),
+                        "response_time": call_elapsed,
+                        "http_status": f"{response.status_code} {response.reason}",
+                        "success": response.status_code == 200,
+                        "request_size_bytes": 0,  # GET requests typically have no body
+                        "response_size_bytes": len(response.text),
                         "process_id": process_id,
-                        "response_time": elapsed,
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size,
-                        "success": False,
-                        "error": f"{response.status_code} {response.reason}",
-                        "final_status": "HTTP Error"
+                        "attempt": api_calls
                     })
-                return {
-                    "status": f"{response.status_code} {response.reason}",
-                    "response_time": elapsed,
-                    "success": False,
-                    "final_status": "HTTP Error",
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size
-                }
-            
-            # If 200 OK, check the JSON response for status in content
+                
+                if response.status_code == 200:
+                    json_response = response.json()
+                    if 'content' in json_response and 'status' in json_response['content']:
+                        status = json_response['content']['status']
+                        if status == 'Completed':
+                            final_status = status
+                            success = True
+                            break
+                        else:
+                            print(f"[{process_id}] Current status: {status}, retrying in {POLLING_INTERVAL}s (Elapsed: {elapsed:.2f}s)")
+                    else:
+                        print(f"[{process_id}] Response missing content or status, retrying...")
+                else:
+                    print(f"[{process_id}] Non-200 response: {response.status_code} {response.reason}, retrying in {POLLING_INTERVAL}s")
+                
+                time.sleep(POLLING_INTERVAL)
+                
+            except Exception as e:
+                call_elapsed = time.time() - call_start
+                api_calls += 1
+                with self.lock:
+                    self.api_stats.append({
+                        "timestamp": datetime.now().isoformat(),
+                        "response_time": call_elapsed,
+                        "http_status": str(e),
+                        "success": False,
+                        "request_size_bytes": 0,
+                        "response_size_bytes": 0,
+                        "process_id": process_id,
+                        "attempt": api_calls
+                    })
+                print(f"[{process_id}] API call failed: {str(e)}, retrying in {POLLING_INTERVAL}s")
+                time.sleep(POLLING_INTERVAL)
+                elapsed = time.time() - start_time
+        
+        result = {
+            "process_id": process_id,
+            "success": success,
+            "total_time": elapsed,
+            "api_calls": api_calls,
+            "final_status": final_status,
+            "start_time": datetime.fromtimestamp(start_time).isoformat(),
+            "end_time": datetime.now().isoformat()
+        }
+        
+        with self.lock:
+            self.results.append(result)
+        
+        return result
+
+    def worker(self):
+        while True:
             try:
-                response_json = response.json()
-                content_status = response_json.get("content", {}).get("status", "Unknown")
+                task = self.queue.get_nowait()
+            except queue.Empty:
+                break
                 
-                # If status is not Completed, poll until it is or max attempts reached
-                if content_status != "Completed":
-                    attempts = 1
-                    while attempts < MAX_STATUS_CHECKS and content_status != "Completed":
-                        time.sleep(STATUS_CHECK_INTERVAL)
-                        check_start = time.time()
-                        response = self.requests_pkcs12.get(
-                            URL_API.format(processUid=process_id),
-                            headers=headers,
-                            pkcs12_filename=PFX_PATH,
-                            pkcs12_password=PFX_PASSPHRASE,
-                            verify=VERIFY_SSL,
-                            timeout=30
-                        )
-                        check_elapsed = time.time() - check_start
-                        elapsed += check_elapsed  # Accumulate all check times
-                        
-                        # Accumulate request/response sizes
-                        request_size += len(str(headers)) + len(URL_API.format(processUid=process_id))
-                        response_size += len(response.text)
-                        
-                        if response.status_code != 200:
-                            with self.lock:
-                                self.api_stats.append({
-                                    "process_id": process_id,
-                                    "response_time": elapsed,
-                                    "request_size_bytes": request_size,
-                                    "response_size_bytes": response_size,
-                                    "success": False,
-                                    "error": f"Status check failed: {response.status_code} {response.reason}",
-                                    "final_status": "HTTP Error during polling"
-                                })
-                            return {
-                                "status": f"Status check failed: {response.status_code} {response.reason}",
-                                "response_time": elapsed,
-                                "success": False,
-                                "final_status": "HTTP Error during polling",
-                                "request_size_bytes": request_size,
-                                "response_size_bytes": response_size
-                            }
-                        
-                        response_json = response.json()
-                        content_status = response_json.get("content", {}).get("status", "Unknown")
-                        attempts += 1
-                
-                if content_status == "Completed":
-                    with self.lock:
-                        self.api_stats.append({
-                            "process_id": process_id,
-                            "response_time": elapsed,
-                            "request_size_bytes": request_size,
-                            "response_size_bytes": response_size,
-                            "success": True,
-                            "final_status": "Completed"
-                        })
-                    return {
-                        "status": f"200 OK - Completed",
-                        "response_time": elapsed,
-                        "success": True,
-                        "final_status": "Completed",
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size
-                    }
+            try:
+                process_id = self.generate_process_id()
+                if process_id:
+                    result = self.check_api_status(process_id)
+                    print(f"Process {process_id} completed with status {result['final_status']} in {result['total_time']:.2f}s")
                 else:
                     with self.lock:
-                        self.api_stats.append({
-                            "process_id": process_id,
-                            "response_time": elapsed,
-                            "request_size_bytes": request_size,
-                            "response_size_bytes": response_size,
+                        self.results.append({
+                            "process_id": "N/A",
                             "success": False,
-                            "error": f"Final status: {content_status} (after {attempts} checks)",
-                            "final_status": f"Timeout - {content_status}"
+                            "total_time": 0,
+                            "api_calls": 0,
+                            "final_status": "ProcessID Generation Failed",
+                            "start_time": datetime.now().isoformat(),
+                            "end_time": datetime.now().isoformat()
                         })
-                    return {
-                        "status": f"200 OK - Final status: {content_status} (after {attempts} checks)",
-                        "response_time": elapsed,
-                        "success": False,
-                        "final_status": f"Timeout - {content_status}",
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size
-                    }
-                    
-            except ValueError:  # JSON decode error
-                with self.lock:
-                    self.api_stats.append({
-                        "process_id": process_id,
-                        "response_time": elapsed,
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size,
-                        "success": False,
-                        "error": "Invalid JSON response",
-                        "final_status": "Invalid JSON"
-                    })
-                return {
-                    "status": "200 OK - Invalid JSON response",
-                    "response_time": elapsed,
-                    "success": False,
-                    "final_status": "Invalid JSON",
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size
-                }
-                
-        except Exception as e:
-            with self.lock:
-                self.api_stats.append({
-                    "process_id": process_id,
-                    "response_time": 0,
-                    "request_size_bytes": 0,
-                    "response_size_bytes": 0,
-                    "success": False,
-                    "error": str(e),
-                    "final_status": f"Exception: {str(e)}"
-                })
-            return {
-                "status": f"Error: {str(e)}",
-                "response_time": 0,
-                "success": False,
-                "final_status": f"Exception: {str(e)}",
-                "request_size_bytes": 0,
-                "response_size_bytes": 0
-            }
-
-    def worker(self, thread_num):
-        try:
-            # Record thread start time
-            thread_start = time.time()
-            
-            token_result = self.token_manager.get_token()
-            if not token_result or not token_result["token"]:
-                raise ValueError("Token generation failed")
-                
-            process_id = self.generate_process_id(token_result["token"])
-            if not process_id:
-                raise ValueError("Process ID generation failed")
-                
-            api_result = self.check_api_status(token_result["token"], process_id)
-            
-            thread_end = time.time()
-            thread_duration = thread_end - thread_start
-            
-            with self.lock:
-                self.completed_processes += 1
-                self.results.append({
-                    "thread_num": thread_num,
-                    "thread_start_time": thread_start - self.start_time,
-                    "thread_duration": thread_duration,
-                    "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "process_id": process_id,
-                    "api_status": api_result["status"],
-                    "response_time_sec": api_result["response_time"],
-                    "success": api_result["success"],
-                    "error_type": None if api_result["success"] else "HTTP",
-                    "final_status": api_result["final_status"],
-                    "request_size_bytes": api_result["request_size_bytes"],
-                    "response_size_bytes": api_result["response_size_bytes"],
-                    "token_response_time": token_result["response_time"],
-                    "token_success": token_result["success"]
-                })
-                print(f"[Thread {thread_num}] Process {process_id}: {api_result['status']} (Total: {thread_duration:.2f}s)")
-                
-            return api_result
-            
-        except Exception as e:
-            thread_end = time.time()
-            thread_duration = thread_end - thread_start
-            
-            with self.lock:
-                self.completed_processes += 1
-                self.results.append({
-                    "thread_num": thread_num,
-                    "thread_start_time": thread_start - self.start_time,
-                    "thread_duration": thread_duration,
-                    "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "process_id": None,
-                    "api_status": f"CRASH: {str(e)}",
-                    "response_time_sec": 0,
-                    "success": False,
-                    "error_type": "SILENT",
-                    "final_status": f"Crash: {str(e)}",
-                    "request_size_bytes": 0,
-                    "response_size_bytes": 0,
-                    "token_response_time": 0,
-                    "token_success": False
-                })
-            print(f"⚠️ Thread {thread_num} failed: {str(e)}")
-            return None
+            finally:
+                self.queue.task_done()
 
     def calculate_metrics(self, data, time_field, size_field=None):
         success_data = [d for d in data if d.get("success", False)]
@@ -453,19 +308,6 @@ class TestRunner:
             token_metrics = self.calculate_metrics(self.token_manager.token_stats, "response_time", "request_size_bytes")
             processing_metrics = self.calculate_metrics(self.processing_stats, "response_time", "request_size_bytes")
             api_metrics = self.calculate_metrics(self.api_stats, "response_time", "request_size_bytes")
-            
-            # Calculate thread completion metrics
-            thread_times = [r["thread_duration"] for r in self.results]
-            thread_metrics = {
-                "total_time": test_duration,
-                "fastest_thread": min(thread_times) if thread_times else 0,
-                "slowest_thread": max(thread_times) if thread_times else 0,
-                "avg_thread_time": statistics.mean(thread_times) if thread_times else 0,
-                "median_thread_time": statistics.median(thread_times) if thread_times else 0,
-                "p90_thread_time": statistics.quantiles(thread_times, n=10)[8] if len(thread_times) >= 10 else 0,
-                "p95_thread_time": statistics.quantiles(thread_times, n=20)[18] if len(thread_times) >= 20 else 0,
-                "p99_thread_time": statistics.quantiles(thread_times, n=100)[98] if len(thread_times) >= 100 else 0,
-            }
             
             # Calculate throughput and KB/sec for each endpoint
             for metrics in [token_metrics, processing_metrics, api_metrics]:
@@ -520,21 +362,10 @@ class TestRunner:
                     row.append(formatter(value))
                 ws.append(row)
             
-            # Add thread metrics section
-            ws.append([])  # Empty row
-            ws.append(["Thread Completion Metrics"])
-            ws.append(["Total Test Duration (seconds)", f"{test_duration:.2f}"])
-            ws.append(["Fastest Thread Completion (seconds)", f"{thread_metrics['fastest_thread']:.2f}"])
-            ws.append(["Slowest Thread Completion (seconds)", f"{thread_metrics['slowest_thread']:.2f}"])
-            ws.append(["Average Thread Completion (seconds)", f"{thread_metrics['avg_thread_time']:.2f}"])
-            ws.append(["Median Thread Completion (seconds)", f"{thread_metrics['median_thread_time']:.2f}"])
-            ws.append(["90th Percentile Thread Time (seconds)", f"{thread_metrics['p90_thread_time']:.2f}"])
-            ws.append(["95th Percentile Thread Time (seconds)", f"{thread_metrics['p95_thread_time']:.2f}"])
-            ws.append(["99th Percentile Thread Time (seconds)", f"{thread_metrics['p99_thread_time']:.2f}"])
-            
             # Add summary section
             ws.append([])  # Empty row
             ws.append(["Test Summary"])
+            ws.append(["Test Duration (seconds)", test_duration])
             ws.append(["Total Threads", MAX_THREADS])
             ws.append(["Total Tokens Generated", self.token_manager.total_tokens_generated])
             ws.append(["Total Process IDs Generated", len(self.processing_stats)])
@@ -544,34 +375,18 @@ class TestRunner:
             ws.append(["Overall Error Rate", f"{((len(self.results) - len([r for r in self.results if r['success']])) / len(self.results) * 100 if len(self.results) > 0 else 0):.2f}%"])
             ws.append(["Overall Throughput (requests/sec)", f"{len(self.results) / test_duration:.2f}"])
             
-            # Add detailed results sheet
-            ws_details = wb.create_sheet("Detailed Results")
-            if self.results:
-                # Create headers
-                headers = list(self.results[0].keys())
-                ws_details.append(headers)
-                
-                # Add data
-                for result in self.results:
-                    ws_details.append([result.get(h, "") for h in headers])
-                
-                # Apply formatting to headers
-                for cell in ws_details[1]:
-                    cell.font = Font(bold=True)
-            
             # Formatting
-            for sheet in wb.worksheets:
-                for col in sheet.columns:
-                    max_length = 0
-                    column = col[0].column_letter
-                    for cell in col:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = (max_length + 2)
-                    sheet.column_dimensions[column].width = adjusted_width
+            for col in ws.columns:
+                max_length = 0
+                column = col[0].column_letter
+                for cell in col:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = (max_length + 2)
+                ws.column_dimensions[column].width = adjusted_width
             
             # Add borders to metrics table
             from openpyxl.styles import Border, Side
@@ -595,37 +410,39 @@ class TestRunner:
             print(f"❌ Failed to generate report: {str(e)}")
             raise
 
-    def run_fixed_thread_test(self):
-        print(f"🚀 Starting fixed thread test with {MAX_THREADS} threads (one flow per thread)...")
-        self.start_time = time.time()
-        self.completed_processes = 0  # Reset counter
+    def run_test(self):
+        print(f"🚀 Starting performance test with {MAX_THREADS} threads...")
+        start_time = time.time()
         
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            # Submit all threads at once
-            futures = {executor.submit(self.worker, i+1): i+1 for i in range(MAX_THREADS)}
+        # Enqueue tasks
+        for _ in range(MAX_THREADS):
+            self.queue.put(None)  # Using None as a simple task indicator
             
-            # Wait for all threads to complete
-            for future in as_completed(futures):
-                thread_num = futures[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    print(f"Thread {thread_num} generated an exception: {str(e)}")
+        # Create and start worker threads
+        threads = []
+        for _ in range(MAX_THREADS):
+            t = threading.Thread(target=self.worker)
+            t.start()
+            threads.append(t)
         
-        self.end_time = time.time()
-        test_duration = self.end_time - self.start_time
+        # Wait for all threads to complete
+        for t in threads:
+            t.join()
+        
+        test_duration = time.time() - start_time
+        
+        # Generate report
+        print("\n📈 Test completed. Generating report...")
         self.generate_report(test_duration)
         
-        print("\n=== FIXED THREAD TEST COMPLETE ===")
-        print(f"Total duration: {test_duration:.2f}s")
-        print(f"Total threads completed: {len(self.results)}")
-        print(f"Tokens generated: {self.token_manager.total_tokens_generated}")
-        print(f"Process IDs generated: {len(self.processing_stats)}")
-        print(f"API calls made: {len(self.api_stats)}")
+        print("\n=== TEST SUMMARY ===")
+        print(f"Total test duration: {test_duration:.2f} seconds")
+        print(f"Total processes attempted: {len(self.results)}")
+        print(f"Successful processes: {len([r for r in self.results if r['success']])}")
+        print(f"Failed processes: {len([r for r in self.results if not r['success']])}")
+        print(f"Token refreshes: {self.token_manager.refresh_counter}")
         print(f"Report saved to: {OUTPUT_EXCEL}")
-        
-        return self.results
 
 if __name__ == "__main__":
     test = TestRunner()
-    results = test.run_fixed_thread_test()
+    test.run_test()
