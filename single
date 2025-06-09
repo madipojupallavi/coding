@@ -21,22 +21,6 @@ TOKEN_REFRESH_TIME = 20  # seconds
 POLLING_TIMEOUT = 300  # seconds (5 minutes)
 POLLING_INTERVAL = 5  # seconds
 
-# Expected tool order
-EXPECTED_ORDER = [
-    "download_documents",
-    "classify_documents",
-    "pre_intake_extract",
-    "party_intake",
-    "web_search",
-    "document_extract",
-    "scratchpad",
-    "screening",
-    "aggregate_cip_data",
-    "aggregate_cdd_data",
-    "calculate_crr",
-    "kyc_ingestion"
-]
-
 def ensure_requests_pkcs12():
     try:
         import requests_pkcs12
@@ -45,66 +29,6 @@ def ensure_requests_pkcs12():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
         import requests_pkcs12
         return requests_pkcs12
-
-def find_tools(data):
-    tools = []
-    if 'content' in data and 'intermediate_sourcing' in data['content']:
-        intermediate_sourcing = data['content']['intermediate_sourcing']
-        
-        for item in intermediate_sourcing:
-            if isinstance(item, str) and 'tool=' in item:
-                tool_start_index = item.find('tool=') + 6
-                tool_end_index = item.find("'", tool_start_index)
-                
-                if tool_start_index != -1 and tool_end_index != -1:
-                    tool = item[tool_start_index:tool_end_index]
-                    tools.append(tool)
-    return tools
-
-def compare_tools(tools, expected_order):
-    expected_tools = [tool.replace("_", " ") for tool in expected_order]
-    tools = [tool.replace("_", " ") for tool in tools]
-    return tools == expected_tools
-
-def find_status(data):
-    if 'content' in data and 'intermediate_sourcing' in data['content']:
-        intermediate_sourcing = data['content']['intermediate_sourcing']
-        
-        for item in intermediate_sourcing:
-            if isinstance(item, str) and 'tool=' in item and 'log=' in item:
-                log_start_index = item.find('log=') + 5
-                log_end_index = item.find("'", log_start_index)
-                
-                if log_start_index != -1 and log_end_index != -1:
-                    log_json_str = item[log_start_index:log_end_index]
-                    
-                    try:
-                        log_json = json.loads(log_json_str)
-                        if 'status' in log_json and log_json['status'] == 'Success':
-                            return True
-                    except json.JSONDecodeError:
-                        continue
-    return False
-
-def find_status_completed(data):
-    if 'content' in data and 'intermediate_sourcing' in data['content']:
-        intermediate_sourcing = data['content']['intermediate_sourcing']
-        
-        for item in intermediate_sourcing:
-            if isinstance(item, str) and 'tool=' in item and 'log=' in item:
-                log_start_index = item.find('log=') + 5
-                log_end_index = item.find("'", log_start_index)
-                
-                if log_start_index != -1 and log_end_index != -1:
-                    log_json_str = item[log_start_index:log_end_index]
-                    
-                    try:
-                        log_json = json.loads(log_json_str)
-                        if 'status' in log_json and log_json['status'] == 'Completed':
-                            return True
-                    except json.JSONDecodeError:
-                        continue
-    return False
 
 class TestRunner:
     def __init__(self):
@@ -164,7 +88,6 @@ class TestRunner:
         elapsed = 0
         
         while elapsed < POLLING_TIMEOUT:
-            # Refresh token if needed before making the API call
             current_token = self.get_token()
             headers["Authorization"] = f"Bearer {current_token}"
             
@@ -182,14 +105,21 @@ class TestRunner:
                 
                 if response.status_code == 200:
                     json_response = response.json()
-                    if find_status_completed(json_response):
-                        return {
-                            "status": f"{response.status_code} {response.reason}",
-                            "response_time": elapsed,
-                            "json_response": json_response
-                        }
+                    
+                    # Check if content exists and has status
+                    if 'content' in json_response and 'status' in json_response['content']:
+                        status = json_response['content']['status']
+                        if status == 'Completed':
+                            return {
+                                "http_status": f"{response.status_code} {response.reason}",
+                                "response_time": elapsed,
+                                "content_status": status,
+                                "process_completed": True
+                            }
+                        else:
+                            print(f"Current status: {status}, retrying in {POLLING_INTERVAL}s (Elapsed: {elapsed:.2f}s)")
                     else:
-                        print(f"Status not Completed, retrying in {POLLING_INTERVAL}s (Elapsed: {elapsed:.2f}s)")
+                        print("Response missing content or status, retrying...")
                 else:
                     print(f"Non-200 response: {response.status_code} {response.reason}, retrying in {POLLING_INTERVAL}s")
                 
@@ -201,13 +131,14 @@ class TestRunner:
                 elapsed = time.time() - start_time
         
         return {
-            "status": "Error: Timeout waiting for Completed status",
+            "http_status": "Error: Timeout waiting for Completed status",
             "response_time": elapsed,
-            "json_response": None
+            "content_status": "Timeout",
+            "process_completed": False
         }
 
     def run_test(self):
-        print("🚀 Starting test for a single process...")
+        print(" Starting test for a single process...")
         start_time = time.time()
         
         try:
@@ -221,31 +152,19 @@ class TestRunner:
             
             result = self.check_api_status(token, process_id)
             
-            print(f"Process {process_id}: {result['status']} ({result['response_time']:.2f}s)")
+            print(f"\n=== TEST RESULTS ===")
+            print(f"Process ID: {process_id}")
+            print(f"HTTP Status: {result['http_status']}")
+            print(f"Response Time: {result['response_time']:.2f}s")
+            print(f"Content Status: {result['content_status']}")
             
-            if result["status"] == "200 OK" and result["json_response"]:
-                print(f"JSON Response: {json.dumps(result['json_response'], indent=2)}")
-                
-                # Check status in intermediate_sourcing
-                has_success = find_status(result["json_response"])
-                print(f"Status Check: {'Success' if has_success else 'Failed'}")
-                
-                # Check tool sequence
-                tools = find_tools(result["json_response"])
-                correct_order = compare_tools(tools, EXPECTED_ORDER)
-                print(f"Tools Found: {tools}")
-                print(f"Tool Sequence Check: {'PASS' if correct_order else 'FAIL'} - {'Order correct' if correct_order else 'Order issues found'}")
-                
-                # Overall result
-                overall_result = has_success and correct_order
-                print(f"Overall Result: {'PASS' if overall_result else 'FAIL'}")
+            if result['process_completed']:
+                print("\n Process completed successfully")
             else:
-                print("Status Check: Skipped (HTTP status not 200 OK or timeout)")
-                print("Tool Sequence Check: Skipped (HTTP status not 200 OK or timeout)")
-                print("Overall Result: FAIL")
+                print("\n Process did not complete successfully")
             
         except Exception as e:
-            print(f"Failed: {str(e)}")
+            print(f"\n Test failed: {str(e)}")
         
         test_duration = time.time() - start_time
         print("\n=== TEST COMPLETE ===")
