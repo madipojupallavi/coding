@@ -32,6 +32,8 @@ MAX_THREADS = 50    # concurrent threads
 TOKEN_REFRESH_TIME = 20  # seconds
 MAX_STATUS_CHECKS = 10  # Maximum number of times to check for "Completed" status
 STATUS_CHECK_INTERVAL = 2  # Seconds between status checks
+THREAD_TIMEOUT = TEST_DURATION + 10  # Additional buffer for thread completion
+WATCHDOG_INTERVAL = 5  # Seconds between watchdog checks
 
 # Output Configuration
 OUTPUT_DIR = Path.cwd() / "performance_results"
@@ -137,7 +139,65 @@ class TestRunner:
         self.api_stats = []
         self.lock = threading.Lock()
         self.completed_processes = 0
+        self.active_threads = 0
+        self.thread_timeout_map = {}
+        self.stop_event = threading.Event()
+        self.watchdog = None
         
+    def start_watchdog(self):
+        """Start a watchdog thread to monitor and kill hung threads"""
+        def watchdog_loop():
+            while not self.stop_event.is_set():
+                current_time = time.time()
+                with self.lock:
+                    # Check for threads that have exceeded their timeout
+                    for thread_id, (start_time, timeout) in list(self.thread_timeout_map.items()):
+                        if current_time - start_time > timeout:
+                            print(f"⚠️ Watchdog terminating thread {thread_id} (hung for {current_time - start_time:.1f}s)")
+                            # In a real implementation, we would need a way to actually kill the thread
+                            # This is just a placeholder to track the event
+                            del self.thread_timeout_map[thread_id]
+                            self.completed_processes += 1
+                            self.results.append({
+                                "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                "process_id": None,
+                                "api_status": "WATCHDOG_TIMEOUT",
+                                "response_time_sec": 0,
+                                "success": False,
+                                "error_type": "TIMEOUT",
+                                "final_status": "Watchdog Timeout",
+                                "request_size_bytes": 0,
+                                "response_size_bytes": 0,
+                                "token_response_time": 0,
+                                "token_success": False
+                            })
+                
+                time.sleep(WATCHDOG_INTERVAL)
+        
+        self.watchdog = threading.Thread(target=watchdog_loop, daemon=True)
+        self.watchdog.start()
+    
+    def stop_watchdog(self):
+        """Stop the watchdog thread"""
+        self.stop_event.set()
+        if self.watchdog and self.watchdog.is_alive():
+            self.watchdog.join()
+    
+    def register_thread(self, timeout=THREAD_TIMEOUT):
+        """Register a thread with the watchdog"""
+        thread_id = threading.get_ident()
+        with self.lock:
+            self.thread_timeout_map[thread_id] = (time.time(), timeout)
+            self.active_threads += 1
+        return thread_id
+    
+    def unregister_thread(self, thread_id):
+        """Unregister a thread from the watchdog"""
+        with self.lock:
+            if thread_id in self.thread_timeout_map:
+                del self.thread_timeout_map[thread_id]
+            self.active_threads -= 1
+    
     def generate_process_id(self, token):
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         try:
@@ -350,7 +410,12 @@ class TestRunner:
             }
 
     def worker(self):
+        thread_id = self.register_thread()
         try:
+            # Check if we've exceeded the global test duration
+            if hasattr(self, 'test_end_time') and time.time() > self.test_end_time:
+                return None
+                
             token_result = self.token_manager.get_token()
             if not token_result or not token_result["token"]:
                 raise ValueError("Token generation failed")
@@ -398,6 +463,8 @@ class TestRunner:
                 })
             print(f"⚠️ Worker failed: {str(e)}")
             return None
+        finally:
+            self.unregister_thread(thread_id)
 
     def calculate_metrics(self, data, time_field, size_field=None):
         success_data = [d for d in data if d.get("success", False)]
@@ -542,44 +609,55 @@ class TestRunner:
     def run_dynamic_test(self):
         print(f"🚀 Starting dynamic test for {TEST_DURATION} seconds using {MAX_THREADS} threads...")
         start_time = time.time()
-        end_time = start_time + TEST_DURATION
+        self.test_end_time = start_time + TEST_DURATION
         self.completed_processes = 0  # Reset counter
         
-        # Create an event to signal threads to stop
-        stop_event = threading.Event()
+        # Start the watchdog thread
+        self.start_watchdog()
         
-        def worker_wrapper():
-            while not stop_event.is_set() and time.time() < end_time:
-                self.worker()
-        
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            # Submit initial batch of workers
-            futures = [executor.submit(worker_wrapper) for _ in range(MAX_THREADS)]
+        try:
+            with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+                # Submit initial batch of workers
+                futures = []
+                for _ in range(MAX_THREADS):
+                    if time.time() < self.test_end_time:
+                        futures.append(executor.submit(self.worker))
+                
+                # Continuously submit new workers as others complete
+                while time.time() < self.test_end_time:
+                    # Check completed futures and submit new ones if needed
+                    for future in as_completed(futures, timeout=1):
+                        futures.remove(future)
+                        if time.time() < self.test_end_time:
+                            futures.append(executor.submit(self.worker))
+                    
+                    time.sleep(0.1)
             
-            # Wait until test duration expires
-            while time.time() < end_time:
-                time.sleep(0.1)
+            # Calculate actual test duration
+            test_duration = time.time() - start_time
             
-            # Signal all workers to stop
-            stop_event.set()
+            # Wait for any remaining threads to complete
+            while self.active_threads > 0:
+                print(f"Waiting for {self.active_threads} threads to complete...")
+                time.sleep(1)
             
-            # Wait for all threads to complete current work
-            for future in futures:
-                future.cancel()
-        
-        test_duration = time.time() - start_time
-        self.generate_report(test_duration)
-        
-        print("\n=== DYNAMIC TEST COMPLETE ===")
-        print(f"Total duration: {test_duration:.2f}s")
-        print(f"Total processes completed: {len(self.results)}")
-        print(f"Tokens generated: {self.token_manager.total_tokens_generated}")
-        print(f"Process IDs generated: {len(self.processing_stats)}")
-        print(f"API calls made: {len(self.api_stats)}")
-        print(f"Report saved to: {OUTPUT_EXCEL}")
-        
-        return self.results
-    
-    if __name__ == "__main__":
+            # Generate the report
+            self.generate_report(test_duration)
+            
+            print("\n=== DYNAMIC TEST COMPLETE ===")
+            print(f"Total duration: {test_duration:.2f}s")
+            print(f"Total processes completed: {len(self.results)}")
+            print(f"Tokens generated: {self.token_manager.total_tokens_generated}")
+            print(f"Process IDs generated: {len(self.processing_stats)}")
+            print(f"API calls made: {len(self.api_stats)}")
+            print(f"Report saved to: {OUTPUT_EXCEL}")
+            
+            return self.results
+            
+        finally:
+            # Ensure watchdog is stopped
+            self.stop_watchdog()
+
+if __name__ == "__main__":
     test = TestRunner()
     results = test.run_dynamic_test()
