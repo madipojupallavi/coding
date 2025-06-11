@@ -30,114 +30,119 @@
         return metrics
 
     def generate_report(self, test_duration):
-        try:
-            print(f"\n📊 Generating comprehensive report at: {OUTPUT_EXCEL}")
-            
-            # Calculate metrics for each endpoint
-            token_metrics = self.calculate_metrics(self.token_manager.token_stats, "response_time", "request_size_bytes")
-            processing_metrics = self.calculate_metrics(self.processing_stats, "response_time", "request_size_bytes")
-            api_metrics = self.calculate_metrics(self.api_stats, "response_time", "request_size_bytes")
-            
-            # Calculate throughput and KB/sec for each endpoint
-            for metrics in [token_metrics, processing_metrics, api_metrics]:
-                metrics["throughput"] = metrics["count"] / test_duration
-                metrics["received_kb_sec"] = metrics["total_response_kb"] / test_duration
-                metrics["sent_kb_sec"] = metrics["total_request_kb"] / test_duration
+    try:
+        print(f"\n📊 Generating comprehensive report at: {OUTPUT_EXCEL}")
 
-            # Create a new Excel workbook with single sheet for all metrics
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Performance Metrics"
-            
-            # Header style
-            header_font = Font(bold=True, color="FFFFFF")
-            header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
-            
-            # Endpoint headers
-            endpoints = ["Token Endpoint", "ProcessID Endpoint", "API Endpoint"]
-            ws.append([""] + endpoints)
-            
-            # Apply header style
-            for cell in ws[1]:
-                cell.font = header_font
-                cell.fill = header_fill
-            
-            # Metrics to display (in order)
-            metric_rows = [
-                ("Total Requests", "count"),
-                ("Successful Requests", "success_count"),
-                ("Failed Requests", "error_count"),
-                ("Error Rate (%)", "error_rate", lambda x: f"{x:.2f}%"),
-                ("Average Latency (s)", "avg", lambda x: f"{x:.4f}"),
-                ("Minimum Latency (s)", "min", lambda x: f"{x:.4f}"),
-                ("Maximum Latency (s)", "max", lambda x: f"{x:.4f}"),
-                ("Median Latency (s)", "median", lambda x: f"{x:.4f}"),
-                ("90th Percentile (s)", "p90", lambda x: f"{x:.4f}"),
-                ("95th Percentile (s)", "p95", lambda x: f"{x:.4f}"),
-                ("99th Percentile (s)", "p99", lambda x: f"{x:.4f}"),
-                ("Throughput (requests/sec)", "throughput", lambda x: f"{x:.2f}"),
-                ("Total Sent (KB)", "total_request_kb", lambda x: f"{x:.2f}"),
-                ("Total Received (KB)", "total_response_kb", lambda x: f"{x:.2f}"),
-                ("Send Rate (KB/sec)", "sent_kb_sec", lambda x: f"{x:.2f}"),
-                ("Receive Rate (KB/sec)", "received_kb_sec", lambda x: f"{x:.2f}")
-            ]
-            
-            # Add all metrics
+        # Calculate metrics for each endpoint
+        token_metrics = self.calculate_metrics(self.token_manager.token_stats, "response_time", "request_size_bytes")
+        processing_metrics = self.calculate_metrics(self.processing_stats, "response_time", "request_size_bytes")
+        api_metrics = self.calculate_metrics(self.api_stats, "response_time", "request_size_bytes")
+
+        # Calculate throughput and KB/sec for each endpoint
+        for metrics in [token_metrics, processing_metrics, api_metrics]:
+            metrics["throughput"] = metrics["count"] / test_duration
+            metrics["received_kb_sec"] = metrics["total_response_kb"] / test_duration
+            metrics["sent_kb_sec"] = metrics["total_request_kb"] / test_duration
+
+        # Create a new Excel workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Performance Metrics"
+
+        # Header style
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+
+        # Define metric rows and formatters
+        metric_rows = [
+            ("Total Requests", "count"),
+            ("Successful Requests", "success_count"),
+            ("Failed Requests", "error_count"),
+            ("Error Rate (%)", "error_rate", lambda x: f"{x:.2f}%"),
+            ("Average Latency (s)", "avg", lambda x: f"{x:.4f}"),
+            ("Minimum Latency (s)", "min", lambda x: f"{x:.4f}"),
+            ("Maximum Latency (s)", "max", lambda x: f"{x:.4f}"),
+            ("Median Latency (s)", "median", lambda x: f"{x:.4f}"),
+            ("90th Percentile (s)", "p90", lambda x: f"{x:.4f}"),
+            ("95th Percentile (s)", "p95", lambda x: f"{x:.4f}"),
+            ("99th Percentile (s)", "p99", lambda x: f"{x:.4f}"),
+            ("Throughput (requests/sec)", "throughput", lambda x: f"{x:.2f}"),
+            ("Total Sent (KB)", "total_request_kb", lambda x: f"{x:.2f}"),
+            ("Total Received (KB)", "total_response_kb", lambda x: f"{x:.2f}"),
+            ("Send Rate (KB/sec)", "sent_kb_sec", lambda x: f"{x:.2f}"),
+            ("Receive Rate (KB/sec)", "received_kb_sec", lambda x: f"{x:.2f}")
+        ]
+
+        # Create horizontal header (row 1)
+        headers = [label for label, *_ in metric_rows]
+        ws.append([""] + headers)
+
+        # Endpoint metrics (rows 2, 3, 4)
+        endpoint_data = [
+            ("Token Endpoint", token_metrics),
+            ("ProcessID Endpoint", processing_metrics),
+            ("API Endpoint", api_metrics)
+        ]
+
+        for endpoint_name, metrics in endpoint_data:
+            row = [endpoint_name]
             for label, metric_key, *formatter in metric_rows:
                 formatter = formatter[0] if formatter else lambda x: x
-                row = [label]
-                for metrics in [token_metrics, processing_metrics, api_metrics]:
-                    value = metrics.get(metric_key, 0)
-                    row.append(formatter(value))
-                ws.append(row)
-            
-            # Add summary section
-            ws.append([])  # Empty row
-            ws.append(["Test Summary"])
-            ws.append(["Test Duration (seconds)", test_duration])
-            ws.append(["Total Threads", MAX_THREADS])
-            ws.append(["Total Tokens Generated", self.token_manager.total_tokens_generated])
-            ws.append(["Total Process IDs Generated", len(self.processing_stats)])
-            ws.append(["Total API Calls", len(self.api_stats)])
-            ws.append(["Total Successful Transactions", len([r for r in self.results if r["success"]])])
-            ws.append(["Total Failed Transactions", len([r for r in self.results if not r["success"]])])
-            ws.append(["Overall Error Rate", f"{((len(self.results) - len([r for r in self.results if r['success']])) / len(self.results) * 100 if len(self.results) > 0 else 0):.2f}%"])
-            ws.append(["Overall Throughput (requests/sec)", f"{len(self.results) / test_duration:.2f}"])
-            
-            # Formatting
-            for col in ws.columns:
-                max_length = 0
-                column = col[0].column_letter
-                for cell in col:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = (max_length + 2)
-                ws.column_dimensions[column].width = adjusted_width
-            
-            # Add borders to metrics table
-            from openpyxl.styles import Border, Side
-            thin_border = Border(left=Side(style='thin'), 
-                                right=Side(style='thin'), 
-                                top=Side(style='thin'), 
-                                bottom=Side(style='thin'))
-            
-            for row in ws.iter_rows(min_row=1, max_row=len(metric_rows)+1, max_col=4):
-                for cell in row:
-                    cell.border = thin_border
-            
-            # Save the workbook
-            wb.save(OUTPUT_EXCEL)
-            print("✅ Comprehensive report generated successfully")
-            
-        except PermissionError:
-            print(f"❌ ERROR: Please close Excel file if open: {OUTPUT_EXCEL}")
-            raise
-        except Exception as e:
-            print(f"❌ Failed to generate report: {str(e)}")
-            raise
+                value = formatter(metrics.get(metric_key, 0))
+                row.append(value)
+            ws.append(row)
+
+        # Add summary section
+        ws.append([])  # Empty row
+        ws.append(["Test Summary"])
+        ws.append(["Test Duration (seconds)", test_duration])
+        ws.append(["Total Threads", MAX_THREADS])
+        ws.append(["Total Tokens Generated", self.token_manager.total_tokens_generated])
+        ws.append(["Total Process IDs Generated", len(self.processing_stats)])
+        ws.append(["Total API Calls", len(self.api_stats)])
+        ws.append(["Total Successful Transactions", len([r for r in self.results if r["success"]])])
+        ws.append(["Total Failed Transactions", len([r for r in self.results if not r["success"]])])
+        ws.append(["Overall Error Rate", f"{((len(self.results) - len([r for r in self.results if r['success']])) / len(self.results) * 100 if len(self.results) > 0 else 0):.2f}%"])
+        ws.append(["Overall Throughput (requests/sec)", f"{len(self.results) / test_duration:.2f}"])
+
+        # Auto-adjust column widths
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if cell.value and len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            ws.column_dimensions[column].width = max_length + 2
+
+        # Apply borders to metrics table
+        from openpyxl.styles import Border, Side
+        thin_border = Border(left=Side(style='thin'),
+                             right=Side(style='thin'),
+                             top=Side(style='thin'),
+                             bottom=Side(style='thin'))
+
+        # Borders for header + 3 endpoint rows
+        for row in ws.iter_rows(min_row=1, max_row=4, max_col=len(metric_rows) + 1):
+            for cell in row:
+                cell.border = thin_border
+                if row[0].row == 1:  # header
+                    cell.font = header_font
+                    cell.fill = header_fill
+
+        # Save Excel file
+        wb.save(OUTPUT_EXCEL)
+        print("✅ Comprehensive report generated successfully")
+
+    except PermissionError:
+        print(f"❌ ERROR: Please close Excel file if open: {OUTPUT_EXCEL}")
+        raise
+    except Exception as e:
+        print(f"❌ Failed to generate report: {str(e)}")
+        raise
+
 
    
 import sys
