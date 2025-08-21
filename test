@@ -1,162 +1,1471 @@
+__init__.py
+"""
+LLM Clients Package for BNYM Eliza
+Provides Eliza client implementation only
+"""
+
+from .eliza_client import ElizaClient
+from .factory import LLMFactory, LLMManager
+
+__all__ = [
+    'ElizaClient',
+    'LLMFactory',
+    'LLMManager'
+]
+
+
+eliza_client.py
+"""
+BNYM Eliza LLM Client Implementation
+Uses internal BNYM Eliza service with JWT certificate authentication
+"""
+
+import os
+import logging
+from typing import Dict, Any
+
+# BNYM Eliza imports
+import bnym_eliza as eliza
+from bnym_eliza_utils import init_logger, get_jwt_from_certs
+
+logger = init_logger(__name__)
+
+class ElizaClient:
+    """
+    BNYM Eliza LLM Client for internal BNY Mellon AI services
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.model = config.get("model", "openai-gpt-4.1")
+        self.temperature = config.get("temperature", 0.7)
+        self.max_tokens = config.get("max_tokens", 2000)
+        self.environment = config.get("environment", "QA")
+
+        # Certificate paths
+        self.cert_paths = config.get("cert_paths", {})
+        self.cer_path = self.cert_paths.get("cer_path", "")
+        self.private_key_path = self.cert_paths.get("private_key_path", "")
+        self.public_key_path = self.cert_paths.get("public_key_path", "")
+
+        # Initialize session
+        self.session = None
+        self._initialize_session()
+
+    def _get_jwt(self):
+        """Generate JWT token from certificates"""
+        try:
+            token = get_jwt_from_certs(self.cer_path, self.private_key_path)
+            logger.info("JWT token successfully generated.")
+            return token
+        except Exception as e:
+            logger.error(f"Failed to generate JWT Token: {e}")
+            raise Exception(f"JWT generation failed: {e}")
+
+    def _initialize_session(self):
+        """Initialize Eliza session with JWT authentication"""
+        try:
+            jwt_token = self._get_jwt()
+            self.session = eliza.Session.connect(env=self.environment, jwt_token=jwt_token)
+            logger.info("Connected to Eliza session.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Eliza session: {e}")
+            raise Exception(f"Eliza session initialization failed: {e}")
+
+    def generate_test_cases(self, jira_data: Dict[str, str]) -> str:
+        """
+        Generate BDD test cases from Jira ticket data using Eliza
+
+        Args:
+            jira_data: Dictionary containing Jira fields
+
+        Returns:
+            str: Generated BDD test cases in .feature format
+        """
+        prompt = self._build_test_case_prompt(jira_data)
+
+        try:
+            response = eliza.ChatCompletion.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            content = response["choices"][0]["message"]["content"]
+            return content
+
+        except Exception as e:
+            logger.error(f"Error generating test cases: {str(e)}")
+            raise Exception(f"Test case generation failed: {e}")
+
+    def regenerate_test_case(self, original_data: Dict[str, str], 
+                           test_case: str, comment: str) -> str:
+        """
+        Regenerate a specific test case based on user comments using Eliza
+
+        Args:
+            original_data: Original Jira ticket data
+            test_case: Previously generated test case
+            comment: User feedback/comment
+
+        Returns:
+            str: Regenerated test case
+        """
+        prompt = self._build_regeneration_prompt(original_data, test_case, comment)
+
+        try:
+            response = eliza.ChatCompletion.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            content = response["choices"][0]["message"]["content"]
+            return content
+
+        except Exception as e:
+            logger.error(f"Error regenerating test case: {str(e)}")
+            raise Exception(f"Test case regeneration failed: {e}")
+
+    def _build_test_case_prompt(self, jira_data: Dict[str, str]) -> str:
+        """
+        Build the prompt for test case generation
+        """
+        prompt = f"""You are an expert test case generator. Generate BDD format test cases in .feature file format based on the following Jira ticket information.
+
+**Instructions:**
+- Generate ONLY test cases in BDD format (Feature/Scenario/Given/When/Then)
+- Do NOT include implementation steps or code
+- Focus on testing the functionality described
+- Generate multiple scenarios covering happy path, edge cases, and error conditions
+- Keep scenarios clear and concise
+
+**Jira Ticket Information:**
+Project: {jira_data.get('project', 'N/A')}
+Key: {jira_data.get('key', 'N/A')}
+Summary: {jira_data.get('Summary', 'N/A')}
+Description: {jira_data.get('Description', 'N/A')}
+Issue Comments: {jira_data.get('Issue Comments', 'N/A')}
+Acceptance Criteria: {jira_data.get('acceptance criteria', 'N/A')}
+
+Generate comprehensive BDD test cases in .feature format:"""
+
+        return prompt
+
+    def _build_regeneration_prompt(self, original_data: Dict[str, str], 
+                                 test_case: str, comment: str) -> str:
+        """
+        Build the prompt for test case regeneration based on comments
+        """
+        prompt = f"""You are an expert test case generator. Please modify the existing BDD test case based on the user's feedback.
+
+**Original Jira Information:**
+Project: {original_data.get('project', 'N/A')}
+Key: {original_data.get('key', 'N/A')}
+Summary: {original_data.get('Summary', 'N/A')}
+
+**Current Test Case:**
+{test_case}
+
+**User Feedback/Comment:**
+{comment}
+
+**Instructions:**
+- Modify the test case based on the user's feedback
+- Maintain BDD format (Feature/Scenario/Given/When/Then)
+- Keep the same feature but adjust scenarios as requested
+- Generate ONLY the modified test case in .feature format
+
+Modified test case:"""
+
+        return prompt
+
+    def get_current_model(self) -> str:
+        """Get the current model name"""
+        return self.model
+
+    def get_current_environment(self) -> str:
+        """Get the current environment"""
+        return self.environment
+
+
+
+
+factory.py
+"""
+LLM Factory and Client Manager for BNYM Eliza
+Simplified version using only Eliza client
+"""
+
+from typing import Dict, Any
+from .eliza_client import ElizaClient
+
+class LLMFactory:
+    """
+    Factory class for creating Eliza LLM client
+    """
+
+    @classmethod
+    def create_client(cls, config: Dict[str, Any]) -> ElizaClient:
+        """
+        Create an Eliza LLM client instance
+
+        Args:
+            config: Configuration dictionary for the client
+
+        Returns:
+            ElizaClient: Instance of the Eliza client
+        """
+        return ElizaClient(config)
+
+class LLMManager:
+    """
+    Manages Eliza LLM client instance and provides a unified interface
+    """
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.client = LLMFactory.create_client(config)
+
+    def generate_test_cases(self, jira_data: Dict[str, str]) -> str:
+        """Generate test cases using Eliza"""
+        return self.client.generate_test_cases(jira_data)
+
+    def regenerate_test_case(self, original_data: Dict[str, str], 
+                           test_case: str, comment: str) -> str:
+        """Regenerate test case based on user feedback using Eliza"""
+        return self.client.regenerate_test_case(original_data, test_case, comment)
+
+    def get_current_model(self) -> str:
+        """Get the current model name"""
+        return self.client.get_current_model()
+
+    def get_current_environment(self) -> str:
+        """Get the current environment"""
+        return self.client.get_current_environment()
+
+
+
+__init__.py
+"""
+BDD Test Case Generator - BNYM Eliza Version
+A Streamlit application for generating BDD test cases from Jira exports using BNYM Eliza AI service
+"""
+
+__version__ = "1.0.0"
+__author__ = "BDD Test Case Generator Team"
+__description__ = "BDD Test Case Generator with BNYM Eliza Integration"
+
+# Import main components
+from .config import ELIZA_CONFIG, CERT_PATHS, APP_CONFIG
+from .llm_clients import LLMManager, LLMFactory
+from .data_utils import JiraDataProcessor, TestCaseManager, ExcelExporter
+
+
+app.py
+"""
+BDD Test Case Generator - Main Streamlit Application
+Using BNYM Eliza LLM Service with Simple UI
+"""
+
+import streamlit as st
+import pandas as pd
+from typing import Dict, List, Any
+import logging
+
+# Import our modules
+from config import ELIZA_CONFIG, CERT_PATHS, APP_CONFIG, JIRA_COLUMNS
+from llm_clients import LLMManager
+from data_utils import JiraDataProcessor, TestCaseManager, ExcelExporter
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Configure Streamlit page
+st.set_page_config(
+    page_title=APP_CONFIG["page_title"],
+    page_icon=APP_CONFIG["page_icon"],
+    layout=APP_CONFIG["layout"],
+    initial_sidebar_state="collapsed"
+)
+
+class TestCaseGeneratorApp:
+    """Main application class"""
+
+    def __init__(self):
+        self.initialize_session_state()
+        self.llm_manager = None
+        self.test_case_manager = TestCaseManager()
+
+    def initialize_session_state(self):
+        """Initialize Streamlit session state variables"""
+        if 'jira_data' not in st.session_state:
+            st.session_state.jira_data = []
+        if 'test_cases_generated' not in st.session_state:
+            st.session_state.test_cases_generated = False
+        if 'test_case_manager' not in st.session_state:
+            st.session_state.test_case_manager = TestCaseManager()
+        if 'llm_initialized' not in st.session_state:
+            st.session_state.llm_initialized = False
+
+    def initialize_llm(self):
+        """Initialize LLM manager with Eliza configuration"""
+        if not st.session_state.llm_initialized:
+            try:
+                # Combine Eliza config with certificate paths
+                config = ELIZA_CONFIG.copy()
+                config["cert_paths"] = CERT_PATHS
+
+                self.llm_manager = LLMManager(config)
+                st.session_state.llm_initialized = True
+                logger.info(f"Initialized BNYM Eliza client")
+
+            except Exception as e:
+                st.error(f"Failed to initialize BNYM Eliza: {str(e)}")
+                st.error("Please check your certificate paths and configuration in config.py")
+                return False
+
+        return True
+
+    def render_header(self):
+        """Render application header and description"""
+        st.title("🧪 BDD Test Case Generator")
+        st.markdown("""
+        **Transform your Jira tickets into comprehensive BDD test cases automatically!**
+
+        This application uses BNYM Eliza AI service to generate behavior-driven development (BDD) test cases from Jira export files.
+        Simply upload your Jira Excel export and get professional test cases in .feature file format.
+        """)
+
+        # Show current configuration (read-only)
+        with st.expander("ℹ️ Current Configuration", expanded=False):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.info(f"**Service:** BNYM Eliza")
+            with col2:
+                st.info(f"**Model:** {ELIZA_CONFIG['model']}")
+            with col3:
+                st.info(f"**Environment:** {ELIZA_CONFIG['environment']}")
+
+    def render_instructions(self):
+        """Render usage instructions"""
+        with st.expander("📋 How to Use This Application", expanded=False):
+            st.markdown("""
+            ### Step-by-Step Instructions:
+
+            1. **Export from Jira:**
+               - Navigate to your Jira project
+               - Go to Issues → Search for issues
+               - Click "Export" → "Excel (All fields)"
+               - Download the Excel file
+
+            2. **Upload File:**
+               - Use the file uploader below to select your Jira Excel file
+               - The application will automatically extract required fields
+
+            3. **Review Data:**
+               - Preview your Jira data to ensure it loaded correctly
+               - Check for any missing fields or data issues
+
+            4. **Generate Test Cases:**
+               - Click "Generate Test Cases" to create BDD test cases using BNYM Eliza
+               - Each Jira ticket will generate comprehensive test scenarios
+
+            5. **Review & Refine:**
+               - Review generated test cases
+               - Add comments for improvements
+               - Regenerate specific test cases as needed
+
+            6. **Export Results:**
+               - Download your test cases as a formatted Excel file
+               - Use the test cases in your testing framework
+
+            ### Required Jira Fields:
+            The application looks for these fields in your Excel export:
+            - **Project** - Project name or key
+            - **Key** - Jira ticket key (e.g., PROJ-123)  
+            - **Summary** - Brief description of the ticket
+            - **Description** - Detailed ticket description
+            - **Issue Comments** - Comments from stakeholders
+            - **Acceptance Criteria** - Defined acceptance criteria
+
+            > 💡 **Tip:** Use "Export → Excel (All fields)" in Jira for best results
+
+            ### BNYM Eliza Integration:
+            - Uses JWT certificate-based authentication
+            - Connects to internal BNYM AI services
+            - Provides secure, enterprise-grade test case generation
+            """)
+
+    def render_file_upload(self):
+        """Render file upload section"""
+        st.header("📁 Upload Jira Export File")
+
+        uploaded_file = st.file_uploader(
+            "Choose your Jira Excel export file",
+            type=['xlsx', 'xls'],
+            help="Upload the Excel file exported from Jira with all fields",
+            key="jira_file_uploader"
+        )
+
+        if uploaded_file is not None:
+            with st.spinner("Processing Jira export file..."):
+                try:
+                    # Process the uploaded file
+                    jira_data = JiraDataProcessor.process_excel_file(uploaded_file)
+                    st.session_state.jira_data = jira_data
+
+                    # Validate data
+                    validation = JiraDataProcessor.validate_jira_data(jira_data)
+
+                    # Show results
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Total Tickets", validation["total_tickets"])
+                    with col2:
+                        st.metric("Valid Tickets", validation["valid_tickets"])
+                    with col3:
+                        st.metric("Data Quality", 
+                                f"{(validation['valid_tickets']/validation['total_tickets']*100):.1f}%")
+
+                    # Show warnings if any
+                    if validation["warnings"]:
+                        st.warning("\n".join(validation["warnings"]))
+
+                    # Show empty fields info
+                    if validation["empty_fields"]:
+                        with st.expander("⚠️ Missing Data Fields", expanded=False):
+                            for field, count in validation["empty_fields"].items():
+                                st.warning(f"**{field}**: {count} tickets have empty values")
+
+                    st.success(f"✅ Successfully loaded {len(jira_data)} Jira tickets!")
+
+                except Exception as e:
+                    st.error(f"Error processing file: {str(e)}")
+                    st.error("Please ensure you uploaded a valid Jira Excel export file.")
+
+    def render_data_preview(self):
+        """Render data preview section"""
+        if st.session_state.jira_data:
+            st.header("👀 Data Preview")
+
+            # Show sample of data
+            df_preview = pd.DataFrame(st.session_state.jira_data)
+
+            # Create tabs for different views
+            tab1, tab2 = st.tabs(["📊 Table View", "📋 Detailed View"])
+
+            with tab1:
+                st.dataframe(
+                    df_preview,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            with tab2:
+                # Show detailed view of first few tickets
+                for i, ticket in enumerate(st.session_state.jira_data[:3]):
+                    with st.expander(f"🎫 {ticket.get('key', f'Ticket {i+1}')} - {ticket.get('Summary', 'No Summary')[:50]}..."):
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.write("**Project:**", ticket.get('project', 'N/A'))
+                            st.write("**Key:**", ticket.get('key', 'N/A'))
+                            st.write("**Summary:**", ticket.get('Summary', 'N/A'))
+
+                        with col2:
+                            st.write("**Description:**", ticket.get('Description', 'N/A')[:200] + "..." if len(ticket.get('Description', '')) > 200 else ticket.get('Description', 'N/A'))
+
+                        st.write("**Acceptance Criteria:**", ticket.get('acceptance criteria', 'N/A'))
+
+                        if ticket.get('Issue Comments'):
+                            st.write("**Comments:**", ticket.get('Issue Comments', '')[:200] + "..." if len(ticket.get('Issue Comments', '')) > 200 else ticket.get('Issue Comments', ''))
+
+            # Download preview as Excel
+            if st.button("📥 Download Data Preview", help="Download the processed Jira data as Excel"):
+                try:
+                    excel_data = ExcelExporter.create_jira_preview_excel(st.session_state.jira_data)
+                    st.download_button(
+                        label="📥 Download Preview Excel",
+                        data=excel_data,
+                        file_name="jira_data_preview.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                except Exception as e:
+                    st.error(f"Error creating preview: {str(e)}")
+
+    def render_test_case_generation(self):
+        """Render test case generation section"""
+        if st.session_state.jira_data and self.initialize_llm():
+            st.header("🚀 Generate Test Cases")
+
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown("""
+                Generate BDD format test cases for your Jira tickets using BNYM Eliza AI service. 
+                Each ticket will produce comprehensive test scenarios covering various test conditions.
+                """)
+
+            with col2:
+                if st.button("🚀 Generate Test Cases", type="primary", use_container_width=True):
+                    self.generate_all_test_cases()
+
+    def generate_all_test_cases(self):
+        """Generate test cases for all Jira tickets using Eliza"""
+        if not self.llm_manager:
+            st.error("BNYM Eliza not initialized. Please check configuration and certificates.")
+            return
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        # Clear previous results
+        st.session_state.test_case_manager = TestCaseManager()
+
+        total_tickets = len(st.session_state.jira_data)
+
+        for i, ticket in enumerate(st.session_state.jira_data):
+            status_text.text(f"Generating test cases for {ticket.get('key', f'Ticket {i+1}')} using BNYM Eliza...")
+
+            try:
+                # Generate test cases using Eliza
+                test_cases = self.llm_manager.generate_test_cases(ticket)
+
+                # Store the result
+                st.session_state.test_case_manager.add_test_case(ticket, test_cases)
+
+                # Update progress
+                progress_bar.progress((i + 1) / total_tickets)
+
+            except Exception as e:
+                st.error(f"Error generating test cases for {ticket.get('key', f'Ticket {i+1}')}: {str(e)}")
+
+        status_text.text("✅ Test case generation completed using BNYM Eliza!")
+        st.session_state.test_cases_generated = True
+
+        # Auto-rerun to show results
+        st.rerun()
+
+    def render_test_cases_display(self):
+        """Render generated test cases with comment functionality"""
+        if (st.session_state.test_cases_generated and 
+            st.session_state.test_case_manager and 
+            st.session_state.test_case_manager.get_all_test_cases()):
+
+            st.header("📝 Generated Test Cases")
+
+            test_cases = st.session_state.test_case_manager.get_all_test_cases()
+
+            # Summary metrics
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Test Cases", len(test_cases))
+            with col2:
+                regenerated_count = sum(1 for tc in test_cases if tc["regeneration_count"] > 0)
+                st.metric("Regenerated Cases", regenerated_count)
+            with col3:
+                total_comments = sum(len(tc["comments"]) for tc in test_cases)
+                st.metric("Total Comments", total_comments)
+
+            # Display each test case
+            for i, test_case in enumerate(test_cases):
+                jira_data = test_case["jira_data"]
+
+                with st.expander(f"🧪 {jira_data.get('key', f'Test Case {i+1}')} - {jira_data.get('Summary', 'No Summary')}", expanded=False):
+
+                    # Show ticket info
+                    col1, col2 = st.columns([1, 1])
+                    with col1:
+                        st.write(f"**Project:** {jira_data.get('project', 'N/A')}")
+                        st.write(f"**Key:** {jira_data.get('key', 'N/A')}")
+                    with col2:
+                        st.write(f"**Regenerated:** {test_case['regeneration_count']} times")
+                        st.write(f"**Comments:** {len(test_case['comments'])}")
+
+                    # Show generated test case
+                    st.subheader("Generated BDD Test Case:")
+                    st.code(test_case["content"], language="gherkin")
+
+                    # Comment section
+                    st.subheader("💬 Add Comment for Improvement:")
+                    comment = st.text_area(
+                        "Describe how you want to modify this test case:",
+                        placeholder="E.g., 'Add more edge cases for invalid inputs' or 'Focus more on error handling scenarios'",
+                        key=f"comment_{i}",
+                        height=100
+                    )
+
+                    col1, col2 = st.columns([1, 4])
+                    with col1:
+                        if st.button(f"🔄 Regenerate", key=f"regen_{i}", help="Regenerate this test case using BNYM Eliza based on your comment"):
+                            if comment.strip():
+                                self.regenerate_test_case(i, comment)
+                            else:
+                                st.warning("Please add a comment describing the changes you want.")
+
+                    # Show previous comments
+                    if test_case["comments"]:
+                        st.subheader("📋 Previous Comments:")
+                        for j, prev_comment in enumerate(test_case["comments"]):
+                            st.text(f"{j+1}. {prev_comment}")
+
+    def regenerate_test_case(self, test_case_id: int, comment: str):
+        """Regenerate a specific test case based on user comment using Eliza"""
+        if not self.llm_manager:
+            st.error("BNYM Eliza not initialized. Please check configuration and certificates.")
+            return
+
+        test_case = st.session_state.test_case_manager.get_test_case(test_case_id)
+        if not test_case:
+            st.error("Test case not found.")
+            return
+
+        with st.spinner(f"Regenerating test case using BNYM Eliza based on your feedback..."):
+            try:
+                # Add comment to test case
+                st.session_state.test_case_manager.add_comment(test_case_id, comment)
+
+                # Regenerate using Eliza
+                new_content = self.llm_manager.regenerate_test_case(
+                    test_case["jira_data"],
+                    test_case["content"], 
+                    comment
+                )
+
+                # Update test case
+                st.session_state.test_case_manager.update_test_case(test_case_id, new_content)
+
+                st.success("✅ Test case regenerated successfully using BNYM Eliza!")
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Error regenerating test case: {str(e)}")
+
+    def render_export_section(self):
+        """Render export functionality"""
+        if (st.session_state.test_cases_generated and 
+            st.session_state.test_case_manager and 
+            st.session_state.test_case_manager.get_all_test_cases()):
+
+            st.header("📤 Export Test Cases")
+
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown("""
+                Export your generated test cases to a professionally formatted Excel file.
+                The export includes all test cases, comments, and regeneration history.
+                """)
+
+            with col2:
+                if st.button("📤 Export to Excel", type="primary", use_container_width=True):
+                    self.export_test_cases()
+
+    def export_test_cases(self):
+        """Export test cases to Excel"""
+        try:
+            test_cases = st.session_state.test_case_manager.get_all_test_cases()
+
+            with st.spinner("Generating Excel file..."):
+                excel_data = ExcelExporter.export_test_cases(test_cases)
+
+                st.download_button(
+                    label="📥 Download Test Cases Excel",
+                    data=excel_data,
+                    file_name="bdd_test_cases_eliza.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+                st.success("✅ Excel file generated successfully!")
+
+        except Exception as e:
+            st.error(f"Error exporting test cases: {str(e)}")
+
+    def render_footer(self):
+        """Render application footer"""
+        st.markdown("---")
+        st.markdown("""
+        <div style='text-align: center; color: #666;'>
+            <p>🧪 BDD Test Case Generator | Powered by BNYM Eliza | 
+            Built with Streamlit</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+    def run(self):
+        """Run the main application"""
+        self.render_header()
+        self.render_instructions()
+
+        # Main workflow
+        self.render_file_upload()
+
+        if st.session_state.jira_data:
+            self.render_data_preview()
+            self.render_test_case_generation()
+
+        if st.session_state.test_cases_generated:
+            self.render_test_cases_display()
+            self.render_export_section()
+
+        self.render_footer()
+
+# Run the application
+if __name__ == "__main__":
+    app = TestCaseGeneratorApp()
+    app.run()
+
+
+config.py
+"""
+Configuration file for Test Case Generator with BNYM Eliza Integration
+Modify these settings as needed for your environment
+"""
+
+import os
+
+# BNYM Eliza Configuration
+ELIZA_CONFIG = {
+    "environment": "QA",  # Change to "PROD" or other environments as needed
+    "model": "openai-gpt-4.1",
+    "temperature": 0.7,
+    "max_tokens": 2000,
+}
+
+# Certificate paths for JWT authentication
+BASE_FOLDER = ""  # Set your base folder path here - MODIFY THIS
+CERT_PATHS = {
+    "cer_path": os.path.join(BASE_FOLDER, 'public 9.cer'),
+    "private_key_path": os.path.join(BASE_FOLDER, 'private 9.key'),
+    "public_key_path": os.path.join(BASE_FOLDER, 'public_key 1.pem')
+}
+
+# App Configuration
+APP_CONFIG = {
+    "page_title": "BDD Test Case Generator",
+    "page_icon": "🧪",
+    "layout": "wide",
+    "max_file_size_mb": 10
+}
+
+# Required Jira columns
+JIRA_COLUMNS = [
+    "project", 
+    "key", 
+    "Description", 
+    "Summary", 
+    "Issue Comments", 
+    "acceptance criteria"
+]
+
+
+data_utils.py
+"""
+Data Processing Utilities
+Handles Excel file processing, Jira data extraction, and test case management
+"""
 
 import pandas as pd
-import numpy as np
-from pathlib import Path
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.utils import get_column_letter
+import io
+from typing import Dict, List, Any, Optional
+import logging
 
-def compare_excel_sheets(input1_path, input2_path, output_path):
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class JiraDataProcessor:
     """
-    Compare two Excel sheets based on AI Holmes Response vs WorkFlowUI data
-    and generate a combined output with status.
-    
-    Args:
-        input1_path (str): Path to first Excel file with AI Holmes Response data
-        input2_path (str): Path to second Excel file with WorkFlowUI data
-        output_path (str): Path for output Excel file
+    Processes Jira Excel exports and extracts required fields
     """
-    
-    try:
-        # Read the Excel files
-        print("Reading input files...")
-        df1 = pd.read_excel(input1_path)
-        df2 = pd.read_excel(input2_path)
-        
-        # Verify required columns exist
-        required_cols_df1 = ['Attribute ID', 'Source', 'AI Holmes Response Key', 'AI Holmes Response Value']
-        required_cols_df2 = ['Attribute ID', 'Source', 'WorkFlowUI Key', 'WorkFlowUI Value']
-        
-        for col in required_cols_df1:
-            if col not in df1.columns:
-                raise ValueError(f"Column '{col}' not found in input1 file")
-                
-        for col in required_cols_df2:
-            if col not in df2.columns:
-                raise ValueError(f"Column '{col}' not found in input2 file")
-        
-        print(f"Input1 shape: {df1.shape}")
-        print(f"Input2 shape: {df2.shape}")
-        
-        # Perform merge on 'Attribute ID' and 'Source'
-        print("Merging data...")
-        merged_df = pd.merge(
-            df1[required_cols_df1], 
-            df2[required_cols_df2], 
-            on=['Attribute ID', 'Source'], 
-            how='outer',
-            suffixes=('_input1', '_input2')
-        )
-        
-        print(f"Merged data shape: {merged_df.shape}")
-        
-        # Handle NaN values for comparison
-        merged_df['AI Holmes Response Key'] = merged_df['AI Holmes Response Key'].fillna('')
-        merged_df['AI Holmes Response Value'] = merged_df['AI Holmes Response Value'].fillna('')
-        merged_df['WorkFlowUI Key'] = merged_df['WorkFlowUI Key'].fillna('')
-        merged_df['WorkFlowUI Value'] = merged_df['WorkFlowUI Value'].fillna('')
-        
-        # Convert to string for comparison to handle mixed data types
-        merged_df['AI Holmes Response Key'] = merged_df['AI Holmes Response Key'].astype(str)
-        merged_df['AI Holmes Response Value'] = merged_df['AI Holmes Response Value'].astype(str)
-        merged_df['WorkFlowUI Key'] = merged_df['WorkFlowUI Key'].astype(str)
-        merged_df['WorkFlowUI Value'] = merged_df['WorkFlowUI Value'].astype(str)
-        
-        # Create status column based on comparison
-        def determine_status(row):
-            # Check if both key and value match
-            key_match = row['AI Holmes Response Key'] == row['WorkFlowUI Key']
-            value_match = row['AI Holmes Response Value'] == row['WorkFlowUI Value']
-            
-            # Handle cases where data is missing from either source
-            ai_has_data = (row['AI Holmes Response Key'] != '' and row['AI Holmes Response Key'] != 'nan') or \
-                         (row['AI Holmes Response Value'] != '' and row['AI Holmes Response Value'] != 'nan')
-            
-            workflow_has_data = (row['WorkFlowUI Key'] != '' and row['WorkFlowUI Key'] != 'nan') or \
-                               (row['WorkFlowUI Value'] != '' and row['WorkFlowUI Value'] != 'nan')
-            
-            if not ai_has_data and not workflow_has_data:
-                return 'Both Empty'
-            elif not ai_has_data:
-                return 'Missing in AI Holmes'
-            elif not workflow_has_data:
-                return 'Missing in WorkFlowUI'
-            elif key_match and value_match:
-                return 'Matched'
-            elif key_match and not value_match:
-                return 'Key Match, Value Mismatch'
-            elif not key_match and value_match:
-                return 'Value Match, Key Mismatch'
-            else:
-                return 'No Match'
-        
-        print("Determining status for each row...")
-        merged_df['Status'] = merged_df.apply(determine_status, axis=1)
-        
-        # Reorder columns for final output
-        output_columns = [
-            'Attribute ID', 
-            'Source', 
-            'AI Holmes Response Key', 
-            'AI Holmes Response Value',
-            'WorkFlowUI Key', 
-            'WorkFlowUI Value',
-            'Status'
-        ]
-        
-        result_df = merged_df[output_columns]
-        
-        # Generate summary statistics
-        print("\n=== COMPARISON SUMMARY ===")
-        print(f"Total records processed: {len(result_df)}")
-        print("\nStatus breakdown:")
-        status_counts = result_df['Status'].value_counts()
-        for status, count in status_counts.items():
-            percentage = (count / len(result_df)) * 100
-            print(f"  {status}: {count} ({percentage:.1f}%)")
-        
-        print(f"\nSource breakdown:")
-        source_counts = result_df['Source'].value_counts()
-        for source, count in source_counts.items():
-            print(f"  {source}: {count}")
-        
-        # Save to Excel
-        print(f"\nSaving results to: {output_path}")
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # Main results sheet
-            result_df.to_excel(writer, sheet_name='Comparison Results', index=False)
-            
-            # Summary sheet
-            summary_data = {
-                'Metric': ['Total Records', 'Matched Records', 'Mismatched Records', 'Missing in AI Holmes', 'Missing in WorkFlowUI'],
-                'Count': [
-                    len(result_df),
-                    len(result_df[result_df['Status'] == 'Matched']),
-                    len(result_df[result_df['Status'].isin(['No Match', 'Key Match, Value Mismatch', 'Value Match, Key Mismatch'])]),
-                    len(result_df[result_df['Status'] == 'Missing in AI Holmes']),
-                    len(result_df[result_df['Status'] == 'Missing in WorkFlowUI'])
+
+    REQUIRED_COLUMNS = [
+        "project", 
+        "key", 
+        "Description", 
+        "Summary", 
+        "Issue Comments", 
+        "acceptance criteria"
+    ]
+
+    @staticmethod
+    def process_excel_file(uploaded_file) -> List[Dict[str, str]]:
+        """
+        Process uploaded Excel file and extract Jira data
+
+        Args:
+            uploaded_file: Streamlit uploaded file object
+
+        Returns:
+            List[Dict]: List of Jira tickets with required fields
+        """
+        try:
+            # Read Excel file
+            df = pd.read_excel(uploaded_file)
+
+            # Convert column names to lowercase for case-insensitive matching
+            df.columns = df.columns.str.strip()
+            column_map = {col.lower(): col for col in df.columns}
+
+            # Extract required columns
+            extracted_data = []
+            missing_columns = []
+
+            for required_col in JiraDataProcessor.REQUIRED_COLUMNS:
+                # Try to find column with case-insensitive matching
+                found = False
+                for col_lower, col_original in column_map.items():
+                    if required_col.lower() in col_lower or col_lower in required_col.lower():
+                        found = True
+                        break
+
+                if not found:
+                    missing_columns.append(required_col)
+
+            if missing_columns:
+                logger.warning(f"Missing columns: {missing_columns}")
+
+            # Process each row
+            for index, row in df.iterrows():
+                ticket_data = {}
+
+                for required_col in JiraDataProcessor.REQUIRED_COLUMNS:
+                    # Find the best matching column
+                    value = ""
+                    for col_lower, col_original in column_map.items():
+                        if (required_col.lower() in col_lower or 
+                            col_lower in required_col.lower() or
+                            required_col.lower() == col_lower):
+                            value = str(row[col_original]) if pd.notna(row[col_original]) else ""
+                            break
+
+                    ticket_data[required_col] = value
+
+                extracted_data.append(ticket_data)
+
+            logger.info(f"Processed {len(extracted_data)} Jira tickets")
+            return extracted_data
+
+        except Exception as e:
+            logger.error(f"Error processing Excel file: {str(e)}")
+            raise e
+
+    @staticmethod
+    def validate_jira_data(data: List[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        Validate extracted Jira data
+
+        Args:
+            data: List of Jira ticket dictionaries
+
+        Returns:
+            Dict: Validation results with warnings and stats
+        """
+        validation_results = {
+            "total_tickets": len(data),
+            "warnings": [],
+            "empty_fields": {},
+            "valid_tickets": 0
+        }
+
+        for i, ticket in enumerate(data):
+            ticket_warnings = []
+            empty_count = 0
+
+            for field, value in ticket.items():
+                if not value or value.strip() == "" or value == "nan":
+                    empty_count += 1
+                    if field not in validation_results["empty_fields"]:
+                        validation_results["empty_fields"][field] = 0
+                    validation_results["empty_fields"][field] += 1
+
+            if empty_count < len(JiraDataProcessor.REQUIRED_COLUMNS) / 2:
+                validation_results["valid_tickets"] += 1
+
+        return validation_results
+
+class TestCaseManager:
+    """
+    Manages test case data structure and operations
+    """
+
+    def __init__(self):
+        self.test_cases = []
+
+    def add_test_case(self, jira_data: Dict[str, str], generated_content: str):
+        """Add a new test case"""
+        test_case = {
+            "id": len(self.test_cases),
+            "jira_data": jira_data,
+            "content": generated_content,
+            "comments": [],
+            "regeneration_count": 0
+        }
+        self.test_cases.append(test_case)
+        return test_case["id"]
+
+    def add_comment(self, test_case_id: int, comment: str):
+        """Add a comment to a test case"""
+        if 0 <= test_case_id < len(self.test_cases):
+            self.test_cases[test_case_id]["comments"].append(comment)
+
+    def update_test_case(self, test_case_id: int, new_content: str):
+        """Update test case content after regeneration"""
+        if 0 <= test_case_id < len(self.test_cases):
+            self.test_cases[test_case_id]["content"] = new_content
+            self.test_cases[test_case_id]["regeneration_count"] += 1
+
+    def get_test_case(self, test_case_id: int) -> Optional[Dict[str, Any]]:
+        """Get a specific test case"""
+        if 0 <= test_case_id < len(self.test_cases):
+            return self.test_cases[test_case_id]
+        return None
+
+    def get_all_test_cases(self) -> List[Dict[str, Any]]:
+        """Get all test cases"""
+        return self.test_cases
+
+class ExcelExporter:
+    """
+    Handles Excel export with proper formatting
+    """
+
+    @staticmethod
+    def export_test_cases(test_cases: List[Dict[str, Any]]) -> bytes:
+        """
+        Export test cases to formatted Excel file
+
+        Args:
+            test_cases: List of test case dictionaries
+
+        Returns:
+            bytes: Excel file content as bytes
+        """
+        try:
+            # Create workbook and worksheet
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "BDD Test Cases"
+
+            # Define headers
+            headers = [
+                "Ticket Key",
+                "Summary", 
+                "Project",
+                "Test Case Content",
+                "Comments",
+                "Regeneration Count"
+            ]
+
+            # Write headers with formatting
+            for col_num, header in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col_num, value=header)
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border = Border(
+                    left=Side(style="thin"),
+                    right=Side(style="thin"), 
+                    top=Side(style="thin"),
+                    bottom=Side(style="thin")
+                )
+
+            # Write data
+            for row_num, test_case in enumerate(test_cases, 2):
+                jira_data = test_case["jira_data"]
+
+                row_data = [
+                    jira_data.get("key", ""),
+                    jira_data.get("Summary", ""),
+                    jira_data.get("project", ""),
+                    test_case.get("content", ""),
+                    "; ".join(test_case.get("comments", [])),
+                    test_case.get("regeneration_count", 0)
                 ]
-            }
-            summary_df = pd.DataFrame(summary_data)
-            summary_df.to_excel(writer, sheet_name='Summary', index=False)
-        
-        print("✅ Comparison completed successfully!")
-        return result_df
-        
-    except FileNotFoundError as e:
-        print(f"❌ File not found: {e}")
-        return None
-    except Exception as e:
-        print(f"❌ Error occurred: {str(e)}")
-        return None
 
-# Example usage
-if __name__ == "__main__":
-    # Set your file paths here
-    input1 = "path/to/your/input1.xlsx"  # Replace with actual path
-    input2 = "path/to/your/input2.xlsx"  # Replace with actual path
-    output = "path/to/your/output.xlsx"  # Replace with actual path
-    
-    # Run the comparison
-    result = compare_excel_sheets(input1, input2, output)
-    
-    if result is not None:
-        print(f"\nFirst 5 rows of results:")
-        print(result.head())
+                for col_num, value in enumerate(row_data, 1):
+                    cell = ws.cell(row=row_num, column=col_num, value=value)
+                    cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+                    cell.border = Border(
+                        left=Side(style="thin"),
+                        right=Side(style="thin"),
+                        top=Side(style="thin"), 
+                        bottom=Side(style="thin")
+                    )
+
+            # Adjust column widths
+            column_widths = [15, 30, 15, 60, 40, 15]  # Custom widths
+            for col_num, width in enumerate(column_widths, 1):
+                ws.column_dimensions[get_column_letter(col_num)].width = width
+
+            # Set row heights for better readability
+            for row in range(2, len(test_cases) + 2):
+                ws.row_dimensions[row].height = 100
+
+            # Save to bytes
+            excel_buffer = io.BytesIO()
+            wb.save(excel_buffer)
+            excel_buffer.seek(0)
+
+            return excel_buffer.getvalue()
+
+        except Exception as e:
+            logger.error(f"Error exporting to Excel: {str(e)}")
+            raise e
+
+    @staticmethod
+    def create_jira_preview_excel(jira_data: List[Dict[str, str]]) -> bytes:
+        """
+        Create Excel preview of Jira data
+        """
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Jira Data Preview"
+
+            if not jira_data:
+                return b""
+
+            # Headers
+            headers = list(jira_data[0].keys())
+
+            # Write headers
+            for col_num, header in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col_num, value=header)
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            # Write data
+            for row_num, ticket in enumerate(jira_data, 2):
+                for col_num, header in enumerate(headers, 1):
+                    cell = ws.cell(row=row_num, column=col_num, value=ticket.get(header, ""))
+                    cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+            # Auto-adjust column widths
+            for column in ws.columns:
+                max_length = 0
+                column_letter = get_column_letter(column[0].column)
+                for cell in column:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except:
+                        pass
+                adjusted_width = min(max_length + 2, 50)  # Cap at 50 characters
+                ws.column_dimensions[column_letter].width = adjusted_width
+
+            # Save to bytes
+            excel_buffer = io.BytesIO()
+            wb.save(excel_buffer)
+            excel_buffer.seek(0)
+
+            return excel_buffer.getvalue()
+
+        except Exception as e:
+            logger.error(f"Error creating Jira preview: {str(e)}")
+            raise e
+
+
+
+project_summary.md
+# BDD Test Case Generator - BNYM Eliza Version
+
+## 🎯 Project Overview
+
+This is a **Streamlit-based BDD test case generator** that integrates with **BNYM Eliza AI service** using your specific integration code. The application transforms Jira ticket exports into comprehensive BDD test cases automatically.
+
+## ✅ Key Features Implemented
+
+### **BNYM Eliza Integration**
+- ✅ Uses your exact integration code: `bnym_eliza` and `bnym_eliza_utils`
+- ✅ JWT certificate-based authentication with your certificate paths
+- ✅ `eliza.ChatCompletion.create()` API calls with "openai-gpt-4.1" model
+- ✅ Environment configuration (QA/PROD)
+- ✅ Proper error handling and logging
+
+### **Streamlit UI (Simplified)**
+- ✅ File upload only (no API key inputs in UI)
+- ✅ Helpful text and instructions
+- ✅ Clean, professional interface
+- ✅ Progress indicators and status updates
+
+### **Configuration in Code**
+- ✅ All settings in `config.py` file
+- ✅ Certificate paths configuration
+- ✅ Eliza model and environment settings
+- ✅ No UI configuration options
+
+### **BDD Test Case Generation**
+- ✅ Proper .feature file format
+- ✅ Given/When/Then structure
+- ✅ Multiple scenarios per ticket
+- ✅ Uses all 6 Jira fields for context
+
+### **Comment & Regeneration System**
+- ✅ Individual test case comments
+- ✅ BNYM Eliza-powered regeneration
+- ✅ Comment history tracking
+- ✅ Smart prompt engineering
+
+### **Excel Processing & Export**
+- ✅ Smart Jira field extraction
+- ✅ Professional Excel formatting
+- ✅ Proper column widths
+- ✅ Data validation and preview
+
+## 🏗️ Architecture
+
+```
+test_case_generator/
+├── config.py                 # MODIFY THIS - Certificate paths & settings
+├── app.py                   # Main Streamlit application
+├── data_utils.py            # Excel processing utilities
+├── llm_clients/             # BNYM Eliza client only
+│   ├── eliza_client.py      # Your Eliza integration code
+│   ├── factory.py           # Simplified factory
+│   └── __init__.py
+├── requirements.txt         # Dependencies (includes bnym_eliza)
+├── sample_jira_export.xlsx  # Test data
+└── README.md               # Complete documentation
+```
+
+## 🔧 Your Eliza Integration Code
+
+The application uses your exact code pattern:
+
+```python
+import bnym_eliza as eliza
+from bnym_eliza_utils import init_logger, get_jwt_from_certs
+
+# JWT Token Generation
+jwt_token = get_jwt_from_certs(CER_PATH, PRIVATE_KEY_PATH)
+
+# Session Connection  
+eliza.session = eliza.Session.connect(env='QA', jwt_token=jwt_token)
+
+# API Call
+response = eliza.ChatCompletion.create(
+    model="openai-gpt-4.1",
+    messages=[{"role":"user", "content": prompt}]
+)
+content = response["choices"][0]["message"]["content"]
+```
+
+## 🚀 Quick Setup
+
+1. **Configure Certificates** (IMPORTANT):
+   ```python
+   # Edit config.py
+   BASE_FOLDER = "/your/certificate/path"  # SET THIS
+   ```
+
+2. **Install & Run**:
+   ```bash
+   pip install -r requirements.txt
+   streamlit run app.py
+   ```
+
+3. **Test**:
+   - Use included `sample_jira_export.xlsx`
+   - Upload your own Jira export
+
+## 🔑 Key Differences from Original
+
+**Removed:**
+- ❌ OpenAI, Gemini, Claude clients
+- ❌ API key configuration in UI
+- ❌ Multiple provider support
+- ❌ External API dependencies
+
+**Added:**
+- ✅ BNYM Eliza client with your exact integration
+- ✅ JWT certificate authentication
+- ✅ Internal BNY Mellon AI service integration
+- ✅ Simplified, secure configuration
+
+## 📋 Configuration Required
+
+You need to modify `config.py`:
+
+```python
+# Set your certificate folder path
+BASE_FOLDER = "/path/to/your/certificates"
+
+# Choose environment
+ELIZA_CONFIG = {
+    "environment": "QA",  # or "PROD"
+    "model": "openai-gpt-4.1"
+}
+```
+
+## 🎉 Ready to Use
+
+The application is **production-ready** for your BNYM environment with:
+- Secure JWT authentication
+- Professional UI with simple file upload
+- Comprehensive BDD test case generation
+- Excel export with proper formatting
+- Comment-based test case improvement
+
+All using your specific BNYM Eliza integration code!
+
+
+
+readme.md
+# BDD Test Case Generator - BNYM Eliza Version
+
+A powerful Streamlit application that automatically generates Behavior-Driven Development (BDD) test cases from Jira ticket exports using BNYM Eliza AI service.
+
+## Features
+
+- 🚀 **BNYM Eliza Integration** - Uses internal BNY Mellon AI service with JWT authentication
+- 📊 **Excel Processing** - Smart parsing of Jira Excel exports with field mapping
+- 🧪 **BDD Format** - Generates test cases in proper .feature file format
+- 💬 **Interactive Comments** - Add feedback and regenerate specific test cases
+- 📤 **Professional Export** - Export to formatted Excel with proper styling
+- 🔧 **Simple Configuration** - All settings in one config file
+- 🔐 **Secure Authentication** - Certificate-based JWT authentication
+
+## Quick Start
+
+### 1. Prerequisites
+
+- Access to BNYM internal network
+- BNYM Eliza certificates (public.cer, private.key, public_key.pem)
+- Python 3.8+ environment
+
+### 2. Installation
+
+```bash
+# Clone or download the application files
+cd test_case_generator
+
+# Install dependencies (internal BNYM packages require special setup)
+pip install -r requirements.txt
+```
+
+### 3. Configuration
+
+**IMPORTANT:** Edit `config.py` to set your certificate paths:
+
+```python
+# Certificate paths - MODIFY THESE PATHS
+BASE_FOLDER = "/path/to/your/certificates"  # Set your certificate folder path
+CERT_PATHS = {
+    "cer_path": os.path.join(BASE_FOLDER, 'public 9.cer'),
+    "private_key_path": os.path.join(BASE_FOLDER, 'private 9.key'),
+    "public_key_path": os.path.join(BASE_FOLDER, 'public_key 1.pem')
+}
+
+# Eliza Configuration
+ELIZA_CONFIG = {
+    "environment": "QA",  # Change to "PROD" as needed
+    "model": "openai-gpt-4.1",
+    "temperature": 0.7,
+    "max_tokens": 2000,
+}
+```
+
+### 4. Run the Application
+
+```bash
+streamlit run app.py
+```
+
+The application will open in your browser at `http://localhost:8501`
+
+## BNYM Eliza Integration
+
+This version uses your specific BNYM Eliza integration code:
+
+```python
+import bnym_eliza as eliza
+from bnym_eliza_utils import init_logger, get_jwt_from_certs
+
+# JWT Authentication
+jwt_token = get_jwt_from_certs(CER_PATH, PRIVATE_KEY_PATH)
+eliza.session = eliza.Session.connect(env='QA', jwt_token=jwt_token)
+
+# Generate test cases
+response = eliza.ChatCompletion.create(
+    model="openai-gpt-4.1",
+    messages=[{"role":"user", "content": prompt}]
+)
+```
+
+## How to Use
+
+### 1. Prepare Jira Export
+- Navigate to your Jira project
+- Go to **Issues** → **Search for issues**
+- Click **Export** → **Excel (All fields)**
+- Download the Excel file
+
+### 2. Upload and Process
+- Use the file uploader in the application
+- The system will automatically extract these required fields:
+  - Project
+  - Key  
+  - Summary
+  - Description
+  - Issue Comments
+  - Acceptance Criteria
+
+### 3. Generate Test Cases
+- Click "Generate Test Cases"  
+- Each Jira ticket will produce comprehensive BDD test scenarios using BNYM Eliza
+- Test cases are generated in .feature file format
+
+### 4. Review and Refine
+- Review generated test cases
+- Add comments for improvements
+- Click "Regenerate" to modify specific test cases using Eliza
+
+### 5. Export Results
+- Download professionally formatted Excel file
+- Contains all test cases, comments, and revision history
+
+## Architecture
+
+### Simplified Design for BNYM Eliza
+```
+test_case_generator/
+├── config.py              # Configuration settings (MODIFY THIS)
+├── app.py                 # Main Streamlit application
+├── data_utils.py          # Excel processing and export utilities
+├── requirements.txt       # Python dependencies  
+└── llm_clients/          # BNYM Eliza client only
+    ├── __init__.py
+    ├── eliza_client.py    # BNYM Eliza implementation
+    └── factory.py         # Simplified factory for Eliza
+```
+
+### Key Components
+
+- **ElizaClient**: Handles JWT authentication and Eliza API calls
+- **LLMManager**: Provides unified interface for test case generation
+- **JiraDataProcessor**: Processes Excel files and extracts required fields
+- **ExcelExporter**: Creates formatted Excel output with proper styling
+
+## Configuration Options
+
+### BNYM Eliza Settings
+- **environment**: Eliza environment ("QA", "PROD")
+- **model**: Model to use ("openai-gpt-4.1")
+- **temperature**: Creativity level (0.0-1.0)  
+- **max_tokens**: Maximum response length
+
+### Certificate Paths
+- **cer_path**: Path to public certificate (.cer file)
+- **private_key_path**: Path to private key (.key file)
+- **public_key_path**: Path to public key (.pem file)
+
+## Sample Output
+
+The application generates BDD test cases in this format:
+
+```gherkin
+Feature: User Login Functionality
+
+  Scenario: Successful login with valid credentials
+    Given user is on the login page
+    And user has valid credentials  
+    When user enters username and password
+    And clicks login button
+    Then user should be redirected to dashboard
+    And welcome message should be displayed
+
+  Scenario: Failed login with invalid credentials
+    Given user is on the login page
+    When user enters invalid credentials
+    And clicks login button
+    Then error message should be displayed
+    And user should remain on login page
+```
+
+## Troubleshooting
+
+### Common Issues
+
+**Certificate/JWT Errors**
+- Verify certificate paths in `config.py`
+- Check that certificates are valid and not expired
+- Ensure you have access to BNYM internal network
+- Verify certificate file permissions
+
+**BNYM Eliza Connection Issues**
+- Check network connectivity to BNYM services
+- Verify environment setting (QA vs PROD)
+- Ensure JWT token generation is working
+- Check Eliza service availability
+
+**File Processing Errors**
+- Use "Excel (All fields)" export from Jira
+- Ensure the Excel file contains the required columns
+- Check file format (.xlsx or .xls)
+
+**Missing Dependencies**
+```bash
+# May require internal BNYM package installation procedures
+pip install -r requirements.txt
+```
+
+### Debug Mode
+Add logging configuration for debugging:
+```python  
+import logging
+logging.basicConfig(level=logging.DEBUG)
+```
+
+## Security Notes
+
+- Certificate files contain sensitive authentication information
+- Never commit certificate files to version control
+- Store certificates in secure locations with proper file permissions
+- Use appropriate environment settings (QA vs PROD)
+
+## Support
+
+For issues specific to BNYM Eliza integration:
+- Contact BNYM Eliza support team
+- Check internal documentation for Eliza service
+- Verify certificate and network requirements
+
+For application issues:
+- Check the troubleshooting section
+- Review configuration settings
+- Ensure all dependencies are installed
+
+---
+
+**Built for BNY Mellon using BNYM Eliza AI Service**
+
+
+
+
+requirements.txt
+# Core dependencies
+streamlit>=1.28.0
+pandas>=1.5.0
+openpyxl>=3.1.0
+
+# BNYM Eliza dependencies (internal packages)
+bnym_eliza
+bnym_eliza_utils
+
+# Optional: For better Excel handling
+xlrd>=2.0.0
+
+# Optional: For enhanced logging
+colorlog>=6.7.0
+
+# Development dependencies (uncomment for development)
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+# black>=22.0.0
+# flake8>=5.0.0
+
+# Note: BNYM Eliza packages are internal and may require 
+# special installation procedures or access to internal repositories
+
+
+
