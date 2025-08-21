@@ -16,7 +16,7 @@ __all__ = [
 
 eliza_client.py
 """
-BNYM Eliza LLM Client Implementation
+BNYM Eliza LLM Client Implementation with Enhanced Error Handling
 Uses internal BNYM Eliza service with JWT certificate authentication
 """
 
@@ -25,10 +25,15 @@ import logging
 from typing import Dict, Any
 
 # BNYM Eliza imports
-import bnym_eliza as eliza
-from bnym_eliza_utils import init_logger, get_jwt_from_certs
+try:
+    import bnym_eliza as eliza
+    from bnym_eliza_utils import init_logger, get_jwt_from_certs
+    ELIZA_AVAILABLE = True
+except ImportError as e:
+    ELIZA_AVAILABLE = False
+    IMPORT_ERROR = str(e)
 
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 class ElizaClient:
     """
@@ -48,29 +53,105 @@ class ElizaClient:
         self.private_key_path = self.cert_paths.get("private_key_path", "")
         self.public_key_path = self.cert_paths.get("public_key_path", "")
 
+        # Validate before initialization
+        self._validate_setup()
+
         # Initialize session
         self.session = None
         self._initialize_session()
 
+    def _validate_setup(self):
+        """Validate that everything is set up correctly before attempting initialization"""
+
+        # Check if BNYM Eliza packages are available
+        if not ELIZA_AVAILABLE:
+            raise Exception(f"BNYM Eliza packages not available: {IMPORT_ERROR}\n"
+                          f"Please ensure bnym_eliza and bnym_eliza_utils are installed.")
+
+        # Check certificate paths
+        if not self.cer_path or not os.path.exists(self.cer_path):
+            raise Exception(f"Certificate file not found: {self.cer_path}\n"
+                          f"Please check the cer_path in your configuration.")
+
+        if not self.private_key_path or not os.path.exists(self.private_key_path):
+            raise Exception(f"Private key file not found: {self.private_key_path}\n"
+                          f"Please check the private_key_path in your configuration.")
+
+        # Check file permissions
+        try:
+            with open(self.cer_path, 'r') as f:
+                pass
+        except PermissionError:
+            raise Exception(f"Cannot read certificate file: {self.cer_path}\n"
+                          f"Please check file permissions.")
+
+        try:
+            with open(self.private_key_path, 'r') as f:
+                pass
+        except PermissionError:
+            raise Exception(f"Cannot read private key file: {self.private_key_path}\n"
+                          f"Please check file permissions.")
+
+        logger.info("✅ BNYM Eliza setup validation passed")
+
     def _get_jwt(self):
         """Generate JWT token from certificates"""
         try:
+            logger.info(f"Generating JWT token using certificates:")
+            logger.info(f"  Certificate: {self.cer_path}")
+            logger.info(f"  Private key: {self.private_key_path}")
+
             token = get_jwt_from_certs(self.cer_path, self.private_key_path)
-            logger.info("JWT token successfully generated.")
+            logger.info("✅ JWT token successfully generated.")
             return token
+
         except Exception as e:
-            logger.error(f"Failed to generate JWT Token: {e}")
-            raise Exception(f"JWT generation failed: {e}")
+            error_msg = f"Failed to generate JWT Token: {str(e)}"
+            logger.error(error_msg)
+
+            # Provide helpful error messages
+            if "No such file" in str(e):
+                raise Exception(f"{error_msg}\n"
+                              f"Certificate files not found. Please check paths in config.py:\n"
+                              f"  • cer_path: {self.cer_path}\n"
+                              f"  • private_key_path: {self.private_key_path}")
+            elif "Permission denied" in str(e):
+                raise Exception(f"{error_msg}\n"
+                              f"Cannot access certificate files. Please check file permissions.")
+            else:
+                raise Exception(f"{error_msg}\n"
+                              f"Please verify certificate files are valid and accessible.")
 
     def _initialize_session(self):
         """Initialize Eliza session with JWT authentication"""
         try:
+            logger.info(f"Initializing BNYM Eliza session (Environment: {self.environment})")
+
             jwt_token = self._get_jwt()
             self.session = eliza.Session.connect(env=self.environment, jwt_token=jwt_token)
-            logger.info("Connected to Eliza session.")
+
+            logger.info("✅ Connected to BNYM Eliza session successfully.")
+
         except Exception as e:
-            logger.error(f"Failed to initialize Eliza session: {e}")
-            raise Exception(f"Eliza session initialization failed: {e}")
+            error_msg = f"Failed to initialize BNYM Eliza session: {str(e)}"
+            logger.error(error_msg)
+
+            # Provide helpful error messages
+            if "connection" in str(e).lower() or "network" in str(e).lower():
+                raise Exception(f"{error_msg}\n"
+                              f"Network connection issue. Please check:\n"
+                              f"  • VPN connection to BNYM network\n"
+                              f"  • Environment setting: {self.environment}\n"
+                              f"  • BNYM Eliza service availability")
+            elif "authentication" in str(e).lower() or "token" in str(e).lower():
+                raise Exception(f"{error_msg}\n"
+                              f"Authentication failed. Please check:\n"
+                              f"  • Certificate files are valid and current\n"
+                              f"  • JWT token generation is working\n"
+                              f"  • Access permissions for BNYM Eliza service")
+            else:
+                raise Exception(f"{error_msg}\n"
+                              f"Please contact BNYM Eliza support team for assistance.")
 
     def generate_test_cases(self, jira_data: Dict[str, str]) -> str:
         """
@@ -85,16 +166,30 @@ class ElizaClient:
         prompt = self._build_test_case_prompt(jira_data)
 
         try:
+            logger.info(f"Generating test cases for ticket: {jira_data.get('key', 'Unknown')}")
+
             response = eliza.ChatCompletion.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}]
             )
+
             content = response["choices"][0]["message"]["content"]
+            logger.info("✅ Test cases generated successfully")
             return content
 
         except Exception as e:
-            logger.error(f"Error generating test cases: {str(e)}")
-            raise Exception(f"Test case generation failed: {e}")
+            error_msg = f"Error generating test cases: {str(e)}"
+            logger.error(error_msg)
+
+            if "session" in str(e).lower():
+                raise Exception(f"{error_msg}\n"
+                              f"Session issue. Please try refreshing the page.")
+            elif "quota" in str(e).lower() or "limit" in str(e).lower():
+                raise Exception(f"{error_msg}\n"
+                              f"API quota or rate limit exceeded. Please try again later.")
+            else:
+                raise Exception(f"{error_msg}\n"
+                              f"Please check BNYM Eliza service status.")
 
     def regenerate_test_case(self, original_data: Dict[str, str], 
                            test_case: str, comment: str) -> str:
@@ -112,21 +207,25 @@ class ElizaClient:
         prompt = self._build_regeneration_prompt(original_data, test_case, comment)
 
         try:
+            logger.info(f"Regenerating test case for ticket: {original_data.get('key', 'Unknown')}")
+
             response = eliza.ChatCompletion.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}]
             )
+
             content = response["choices"][0]["message"]["content"]
+            logger.info("✅ Test case regenerated successfully")
             return content
 
         except Exception as e:
-            logger.error(f"Error regenerating test case: {str(e)}")
-            raise Exception(f"Test case regeneration failed: {e}")
+            error_msg = f"Error regenerating test case: {str(e)}"
+            logger.error(error_msg)
+            raise Exception(f"{error_msg}\n"
+                          f"Please try again or contact support.")
 
     def _build_test_case_prompt(self, jira_data: Dict[str, str]) -> str:
-        """
-        Build the prompt for test case generation
-        """
+        """Build the prompt for test case generation"""
         prompt = f"""You are an expert test case generator. Generate BDD format test cases in .feature file format based on the following Jira ticket information.
 
 **Instructions:**
@@ -150,9 +249,7 @@ Generate comprehensive BDD test cases in .feature format:"""
 
     def _build_regeneration_prompt(self, original_data: Dict[str, str], 
                                  test_case: str, comment: str) -> str:
-        """
-        Build the prompt for test case regeneration based on comments
-        """
+        """Build the prompt for test case regeneration based on comments"""
         prompt = f"""You are an expert test case generator. Please modify the existing BDD test case based on the user's feedback.
 
 **Original Jira Information:**
@@ -184,17 +281,34 @@ Modified test case:"""
         """Get the current environment"""
         return self.environment
 
+    def get_status(self) -> Dict[str, Any]:
+        """Get client status for debugging"""
+        return {
+            "model": self.model,
+            "environment": self.environment,
+            "session_active": self.session is not None,
+            "certificate_files": {
+                "cer_exists": os.path.exists(self.cer_path),
+                "key_exists": os.path.exists(self.private_key_path),
+                "cer_path": self.cer_path,
+                "key_path": self.private_key_path
+            }
+        }
+
+
 
 
 
 factory.py
 """
-LLM Factory and Client Manager for BNYM Eliza
-Simplified version using only Eliza client
+LLM Factory and Client Manager for BNYM Eliza with Enhanced Error Handling
 """
 
 from typing import Dict, Any
 from .eliza_client import ElizaClient
+import logging
+
+logger = logging.getLogger(__name__)
 
 class LLMFactory:
     """
@@ -204,7 +318,7 @@ class LLMFactory:
     @classmethod
     def create_client(cls, config: Dict[str, Any]) -> ElizaClient:
         """
-        Create an Eliza LLM client instance
+        Create an Eliza LLM client instance with validation
 
         Args:
             config: Configuration dictionary for the client
@@ -212,7 +326,11 @@ class LLMFactory:
         Returns:
             ElizaClient: Instance of the Eliza client
         """
-        return ElizaClient(config)
+        try:
+            return ElizaClient(config)
+        except Exception as e:
+            logger.error(f"Failed to create BNYM Eliza client: {str(e)}")
+            raise e
 
 class LLMManager:
     """
@@ -221,56 +339,76 @@ class LLMManager:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.client = LLMFactory.create_client(config)
+        self.client = None
+        self._create_client()
+
+    def _create_client(self):
+        """Create the Eliza client with error handling"""
+        try:
+            self.client = LLMFactory.create_client(self.config)
+            logger.info("✅ BNYM Eliza LLM Manager initialized successfully")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize BNYM Eliza LLM Manager: {str(e)}")
+            raise e
 
     def generate_test_cases(self, jira_data: Dict[str, str]) -> str:
         """Generate test cases using Eliza"""
+        if not self.client:
+            raise Exception("BNYM Eliza client not initialized")
+
         return self.client.generate_test_cases(jira_data)
 
     def regenerate_test_case(self, original_data: Dict[str, str], 
                            test_case: str, comment: str) -> str:
         """Regenerate test case based on user feedback using Eliza"""
+        if not self.client:
+            raise Exception("BNYM Eliza client not initialized")
+
         return self.client.regenerate_test_case(original_data, test_case, comment)
 
     def get_current_model(self) -> str:
         """Get the current model name"""
+        if not self.client:
+            return "Not initialized"
         return self.client.get_current_model()
 
     def get_current_environment(self) -> str:
         """Get the current environment"""
+        if not self.client:
+            return "Not initialized"
         return self.client.get_current_environment()
 
+    def get_status(self) -> Dict[str, Any]:
+        """Get detailed status for debugging"""
+        if not self.client:
+            return {"status": "Not initialized", "error": "Client creation failed"}
+
+        return self.client.get_status()
+
+    def is_ready(self) -> bool:
+        """Check if the client is ready to use"""
+        return self.client is not None
 
 
-__init__.py
-"""
-BDD Test Case Generator - BNYM Eliza Version
-A Streamlit application for generating BDD test cases from Jira exports using BNYM Eliza AI service
-"""
 
-__version__ = "1.0.0"
-__author__ = "BDD Test Case Generator Team"
-__description__ = "BDD Test Case Generator with BNYM Eliza Integration"
 
-# Import main components
-from .config import ELIZA_CONFIG, CERT_PATHS, APP_CONFIG
-from .llm_clients import LLMManager, LLMFactory
-from .data_utils import JiraDataProcessor, TestCaseManager, ExcelExporter
+
 
 
 app.py
 """
 BDD Test Case Generator - Main Streamlit Application
-Using BNYM Eliza LLM Service with Simple UI
+Using BNYM Eliza LLM Service with Enhanced Error Handling
 """
 
 import streamlit as st
 import pandas as pd
 from typing import Dict, List, Any
 import logging
+import traceback
 
 # Import our modules
-from config import ELIZA_CONFIG, CERT_PATHS, APP_CONFIG, JIRA_COLUMNS
+from config import ELIZA_CONFIG, CERT_PATHS, APP_CONFIG, JIRA_COLUMNS, get_configuration_status
 from llm_clients import LLMManager
 from data_utils import JiraDataProcessor, TestCaseManager, ExcelExporter
 
@@ -287,7 +425,7 @@ st.set_page_config(
 )
 
 class TestCaseGeneratorApp:
-    """Main application class"""
+    """Main application class with enhanced error handling"""
 
     def __init__(self):
         self.initialize_session_state()
@@ -304,22 +442,159 @@ class TestCaseGeneratorApp:
             st.session_state.test_case_manager = TestCaseManager()
         if 'llm_initialized' not in st.session_state:
             st.session_state.llm_initialized = False
+        if 'config_status' not in st.session_state:
+            st.session_state.config_status = get_configuration_status()
+
+    def check_configuration(self):
+        """Check and display configuration status"""
+        config_status = get_configuration_status()
+
+        if not config_status["is_valid"]:
+            st.error("🚨 **Configuration Issues Detected**")
+            st.markdown("**Please fix the following issues in `config.py`:**")
+
+            for error in config_status["validation_errors"]:
+                st.error(error)
+
+            with st.expander("📋 Configuration Help", expanded=True):
+                st.markdown("""
+                ### Steps to Fix Configuration:
+
+                1. **Edit the `config.py` file**
+                2. **Set the BASE_FOLDER variable** to the path where your certificates are located:
+                   ```python
+                   BASE_FOLDER = "/path/to/your/certificates"  # Replace with actual path
+                   ```
+
+                3. **Ensure your certificate files exist:**
+                   - `public 9.cer`
+                   - `private 9.key`
+                   - `public_key 1.pem`
+
+                4. **Save the config.py file** and refresh this page
+
+                ### Example Configuration:
+                ```python
+                # Windows example
+                BASE_FOLDER = "C:\\Users\\YourName\\Documents\\certificates"
+
+                # Linux/Mac example  
+                BASE_FOLDER = "/home/username/certificates"
+                ```
+                """)
+
+            return False
+
+        # Show warnings if any
+        if config_status["validation_warnings"]:
+            for warning in config_status["validation_warnings"]:
+                st.warning(warning)
+
+        return True
 
     def initialize_llm(self):
-        """Initialize LLM manager with Eliza configuration"""
+        """Initialize LLM manager with enhanced error handling"""
         if not st.session_state.llm_initialized:
-            try:
-                # Combine Eliza config with certificate paths
-                config = ELIZA_CONFIG.copy()
-                config["cert_paths"] = CERT_PATHS
 
-                self.llm_manager = LLMManager(config)
-                st.session_state.llm_initialized = True
-                logger.info(f"Initialized BNYM Eliza client")
+            # First check configuration
+            if not self.check_configuration():
+                return False
+
+            try:
+                with st.spinner("🔄 Initializing BNYM Eliza connection..."):
+                    # Combine Eliza config with certificate paths
+                    config = ELIZA_CONFIG.copy()
+                    config["cert_paths"] = CERT_PATHS
+
+                    self.llm_manager = LLMManager(config)
+                    st.session_state.llm_initialized = True
+
+                    st.success("✅ BNYM Eliza initialized successfully!")
+                    logger.info("✅ BNYM Eliza client initialized successfully")
+
+                    # Show connection details
+                    with st.expander("🔗 Connection Details", expanded=False):
+                        status = self.llm_manager.get_status()
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.info(f"**Environment:** {self.llm_manager.get_current_environment()}")
+                            st.info(f"**Model:** {self.llm_manager.get_current_model()}")
+                        with col2:
+                            st.info(f"**Session Active:** {'Yes' if status.get('session_active', False) else 'No'}")
+                            st.info(f"**Certificates:** {'Valid' if status.get('certificate_files', {}).get('cer_exists', False) else 'Invalid'}")
+
+                    return True
 
             except Exception as e:
-                st.error(f"Failed to initialize BNYM Eliza: {str(e)}")
-                st.error("Please check your certificate paths and configuration in config.py")
+                st.session_state.llm_initialized = False
+                error_msg = str(e)
+
+                st.error("❌ **Failed to initialize BNYM Eliza**")
+                st.error(f"**Error:** {error_msg}")
+
+                # Provide specific help based on error type
+                if "certificate" in error_msg.lower() or "file not found" in error_msg.lower():
+                    with st.expander("🔧 Certificate Issues Help", expanded=True):
+                        st.markdown(f"""
+                        ### Certificate File Issues
+
+                        **Current Configuration:**
+                        - Base Folder: `{CERT_PATHS.get('cer_path', 'Not set').rsplit('/', 1)[0] if CERT_PATHS.get('cer_path') else 'Not set'}`
+                        - Certificate File: `{CERT_PATHS.get('cer_path', 'Not set')}`
+                        - Private Key File: `{CERT_PATHS.get('private_key_path', 'Not set')}`
+
+                        **Solutions:**
+                        1. Verify the certificate files exist at the specified paths
+                        2. Check file permissions (files should be readable)
+                        3. Update the BASE_FOLDER in config.py if files are in a different location
+                        4. Contact your system administrator if you don't have the certificate files
+                        """)
+
+                elif "import" in error_msg.lower() or "module" in error_msg.lower():
+                    with st.expander("📦 Package Issues Help", expanded=True):
+                        st.markdown("""
+                        ### BNYM Eliza Package Issues
+
+                        The BNYM Eliza packages are not available. This could be because:
+
+                        1. **Internal packages not installed:** Contact your IT team for help installing `bnym_eliza` and `bnym_eliza_utils`
+                        2. **Environment issues:** Ensure you're in the correct Python environment
+                        3. **Network access:** Verify you have access to internal BNYM repositories
+
+                        **Next Steps:**
+                        - Contact BNYM IT support for package installation
+                        - Verify you're connected to the BNYM internal network
+                        """)
+
+                elif "connection" in error_msg.lower() or "network" in error_msg.lower():
+                    with st.expander("🌐 Connection Issues Help", expanded=True):
+                        st.markdown("""
+                        ### Network Connection Issues
+
+                        **Possible Solutions:**
+                        1. **VPN Connection:** Ensure you're connected to the BNYM VPN
+                        2. **Network Access:** Verify access to internal BNYM services
+                        3. **Environment Setting:** Check if the environment (QA/PROD) is correct
+                        4. **Service Status:** Contact BNYM Eliza support team to check service availability
+                        """)
+
+                else:
+                    with st.expander("🆘 General Help", expanded=False):
+                        st.markdown(f"""
+                        ### Troubleshooting Steps
+
+                        1. **Check Configuration:** Verify all settings in config.py
+                        2. **Restart Application:** Try refreshing the page
+                        3. **Check Logs:** Review any error messages above
+                        4. **Contact Support:** Reach out to BNYM Eliza support team
+
+                        **Error Details for Support:**
+                        ```
+                        {error_msg}
+                        ```
+                        """)
+
+                logger.error(f"❌ Failed to initialize BNYM Eliza: {error_msg}")
                 return False
 
         return True
@@ -328,21 +603,27 @@ class TestCaseGeneratorApp:
         """Render application header and description"""
         st.title("🧪 BDD Test Case Generator")
         st.markdown("""
-        **Transform your Jira tickets into comprehensive BDD test cases automatically!**
+        **Transform your Jira tickets into comprehensive BDD test cases using BNYM Eliza AI!**
 
         This application uses BNYM Eliza AI service to generate behavior-driven development (BDD) test cases from Jira export files.
         Simply upload your Jira Excel export and get professional test cases in .feature file format.
         """)
 
-        # Show current configuration (read-only)
-        with st.expander("ℹ️ Current Configuration", expanded=False):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.info(f"**Service:** BNYM Eliza")
-            with col2:
-                st.info(f"**Model:** {ELIZA_CONFIG['model']}")
-            with col3:
-                st.info(f"**Environment:** {ELIZA_CONFIG['environment']}")
+        # Show current configuration status
+        config_status = get_configuration_status()
+
+        if config_status["is_valid"]:
+            # Show current configuration (read-only)
+            with st.expander("ℹ️ Current Configuration", expanded=False):
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.info(f"**Service:** BNYM Eliza")
+                with col2:
+                    st.info(f"**Model:** {ELIZA_CONFIG['model']}")
+                with col3:
+                    st.info(f"**Environment:** {ELIZA_CONFIG['environment']}")
+        else:
+            st.warning("⚠️ **Configuration Required** - Please check configuration issues below")
 
     def render_instructions(self):
         """Render usage instructions"""
@@ -350,30 +631,34 @@ class TestCaseGeneratorApp:
             st.markdown("""
             ### Step-by-Step Instructions:
 
-            1. **Export from Jira:**
+            1. **Configure Certificates** (if not done already):
+               - Edit `config.py` and set the `BASE_FOLDER` to your certificate folder path
+               - Ensure you have the required certificate files
+
+            2. **Export from Jira:**
                - Navigate to your Jira project
                - Go to Issues → Search for issues
                - Click "Export" → "Excel (All fields)"
                - Download the Excel file
 
-            2. **Upload File:**
+            3. **Upload File:**
                - Use the file uploader below to select your Jira Excel file
                - The application will automatically extract required fields
 
-            3. **Review Data:**
+            4. **Review Data:**
                - Preview your Jira data to ensure it loaded correctly
                - Check for any missing fields or data issues
 
-            4. **Generate Test Cases:**
+            5. **Generate Test Cases:**
                - Click "Generate Test Cases" to create BDD test cases using BNYM Eliza
                - Each Jira ticket will generate comprehensive test scenarios
 
-            5. **Review & Refine:**
+            6. **Review & Refine:**
                - Review generated test cases
                - Add comments for improvements
                - Regenerate specific test cases as needed
 
-            6. **Export Results:**
+            7. **Export Results:**
                - Download your test cases as a formatted Excel file
                - Use the test cases in your testing framework
 
@@ -387,15 +672,16 @@ class TestCaseGeneratorApp:
             - **Acceptance Criteria** - Defined acceptance criteria
 
             > 💡 **Tip:** Use "Export → Excel (All fields)" in Jira for best results
-
-            ### BNYM Eliza Integration:
-            - Uses JWT certificate-based authentication
-            - Connects to internal BNYM AI services
-            - Provides secure, enterprise-grade test case generation
             """)
 
     def render_file_upload(self):
         """Render file upload section"""
+        # Only show if configuration is valid
+        config_status = get_configuration_status()
+        if not config_status["is_valid"]:
+            st.info("👆 Please fix the configuration issues above before uploading files.")
+            return
+
         st.header("📁 Upload Jira Export File")
 
         uploaded_file = st.file_uploader(
@@ -440,6 +726,16 @@ class TestCaseGeneratorApp:
                 except Exception as e:
                     st.error(f"Error processing file: {str(e)}")
                     st.error("Please ensure you uploaded a valid Jira Excel export file.")
+
+                    with st.expander("🔧 File Processing Help"):
+                        st.markdown("""
+                        ### Common File Issues:
+
+                        1. **Wrong file format:** Use Excel files (.xlsx or .xls) only
+                        2. **Not from Jira:** Ensure the file is exported from Jira using "Excel (All fields)"
+                        3. **Corrupted file:** Try re-exporting from Jira
+                        4. **Missing columns:** Ensure the export includes all required fields
+                        """)
 
     def render_data_preview(self):
         """Render data preview section"""
@@ -493,7 +789,7 @@ class TestCaseGeneratorApp:
 
     def render_test_case_generation(self):
         """Render test case generation section"""
-        if st.session_state.jira_data and self.initialize_llm():
+        if st.session_state.jira_data:
             st.header("🚀 Generate Test Cases")
 
             col1, col2 = st.columns([3, 1])
@@ -505,12 +801,13 @@ class TestCaseGeneratorApp:
 
             with col2:
                 if st.button("🚀 Generate Test Cases", type="primary", use_container_width=True):
-                    self.generate_all_test_cases()
+                    if self.initialize_llm():
+                        self.generate_all_test_cases()
 
     def generate_all_test_cases(self):
         """Generate test cases for all Jira tickets using Eliza"""
-        if not self.llm_manager:
-            st.error("BNYM Eliza not initialized. Please check configuration and certificates.")
+        if not self.llm_manager or not self.llm_manager.is_ready():
+            st.error("❌ BNYM Eliza not ready. Please check configuration and certificates.")
             return
 
         progress_bar = st.progress(0)
@@ -520,9 +817,12 @@ class TestCaseGeneratorApp:
         st.session_state.test_case_manager = TestCaseManager()
 
         total_tickets = len(st.session_state.jira_data)
+        successful_generations = 0
+        failed_generations = 0
 
         for i, ticket in enumerate(st.session_state.jira_data):
-            status_text.text(f"Generating test cases for {ticket.get('key', f'Ticket {i+1}')} using BNYM Eliza...")
+            ticket_key = ticket.get('key', f'Ticket {i+1}')
+            status_text.text(f"🔄 Generating test cases for {ticket_key} using BNYM Eliza... ({i+1}/{total_tickets})")
 
             try:
                 # Generate test cases using Eliza
@@ -530,18 +830,39 @@ class TestCaseGeneratorApp:
 
                 # Store the result
                 st.session_state.test_case_manager.add_test_case(ticket, test_cases)
+                successful_generations += 1
 
                 # Update progress
                 progress_bar.progress((i + 1) / total_tickets)
 
             except Exception as e:
-                st.error(f"Error generating test cases for {ticket.get('key', f'Ticket {i+1}')}: {str(e)}")
+                failed_generations += 1
+                st.error(f"❌ Error generating test cases for {ticket_key}: {str(e)}")
 
-        status_text.text("✅ Test case generation completed using BNYM Eliza!")
-        st.session_state.test_cases_generated = True
+                # Continue with next ticket instead of stopping
+                progress_bar.progress((i + 1) / total_tickets)
 
-        # Auto-rerun to show results
-        st.rerun()
+        # Show final status
+        if successful_generations > 0:
+            status_text.text(f"✅ Test case generation completed! Generated: {successful_generations}, Failed: {failed_generations}")
+            st.session_state.test_cases_generated = True
+
+            # Show summary
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("✅ Successful", successful_generations)
+            with col2:
+                st.metric("❌ Failed", failed_generations)
+            with col3:
+                st.metric("📊 Success Rate", f"{(successful_generations/total_tickets*100):.1f}%")
+
+            if failed_generations > 0:
+                st.warning(f"⚠️ {failed_generations} tickets failed to generate. You can try regenerating them individually later.")
+
+            # Auto-rerun to show results
+            st.rerun()
+        else:
+            status_text.text("❌ All test case generations failed. Please check BNYM Eliza connection.")
 
     def render_test_cases_display(self):
         """Render generated test cases with comment functionality"""
@@ -608,8 +929,8 @@ class TestCaseGeneratorApp:
 
     def regenerate_test_case(self, test_case_id: int, comment: str):
         """Regenerate a specific test case based on user comment using Eliza"""
-        if not self.llm_manager:
-            st.error("BNYM Eliza not initialized. Please check configuration and certificates.")
+        if not self.llm_manager or not self.llm_manager.is_ready():
+            st.error("❌ BNYM Eliza not ready. Please check configuration and certificates.")
             return
 
         test_case = st.session_state.test_case_manager.get_test_case(test_case_id)
@@ -617,7 +938,7 @@ class TestCaseGeneratorApp:
             st.error("Test case not found.")
             return
 
-        with st.spinner(f"Regenerating test case using BNYM Eliza based on your feedback..."):
+        with st.spinner(f"🔄 Regenerating test case using BNYM Eliza based on your feedback..."):
             try:
                 # Add comment to test case
                 st.session_state.test_case_manager.add_comment(test_case_id, comment)
@@ -636,7 +957,16 @@ class TestCaseGeneratorApp:
                 st.rerun()
 
             except Exception as e:
-                st.error(f"Error regenerating test case: {str(e)}")
+                st.error(f"❌ Error regenerating test case: {str(e)}")
+
+                with st.expander("🔧 Regeneration Help"):
+                    st.markdown("""
+                    ### Possible Solutions:
+                    1. **Check Connection:** Ensure BNYM Eliza service is accessible
+                    2. **Try Again:** Some temporary issues resolve with retry
+                    3. **Simplify Comment:** Try a shorter, more specific comment
+                    4. **Contact Support:** If issue persists, contact BNYM Eliza support
+                    """)
 
     def render_export_section(self):
         """Render export functionality"""
@@ -689,21 +1019,27 @@ class TestCaseGeneratorApp:
 
     def run(self):
         """Run the main application"""
-        self.render_header()
-        self.render_instructions()
+        try:
+            self.render_header()
+            self.render_instructions()
 
-        # Main workflow
-        self.render_file_upload()
+            # Main workflow
+            self.render_file_upload()
 
-        if st.session_state.jira_data:
-            self.render_data_preview()
-            self.render_test_case_generation()
+            if st.session_state.jira_data:
+                self.render_data_preview()
+                self.render_test_case_generation()
 
-        if st.session_state.test_cases_generated:
-            self.render_test_cases_display()
-            self.render_export_section()
+            if st.session_state.test_cases_generated:
+                self.render_test_cases_display()
+                self.render_export_section()
 
-        self.render_footer()
+            self.render_footer()
+
+        except Exception as e:
+            st.error(f"❌ **Application Error:** {str(e)}")
+            with st.expander("🐛 Debug Information"):
+                st.code(traceback.format_exc())
 
 # Run the application
 if __name__ == "__main__":
@@ -711,15 +1047,41 @@ if __name__ == "__main__":
     app.run()
 
 
+
 config.py
 """
 Configuration file for Test Case Generator with BNYM Eliza Integration
-Modify these settings as needed for your environment
+*** IMPORTANT: You MUST modify the certificate paths below ***
 """
 
 import os
 
-# BNYM Eliza Configuration
+# ========================================
+# CERTIFICATE CONFIGURATION - MODIFY THIS
+# ========================================
+
+# IMPORTANT: Set this to the actual path where your certificates are located
+# Example: BASE_FOLDER = "/home/user/certificates" or "C:\\Users\\user\\certificates"
+BASE_FOLDER = ""  # *** CHANGE THIS TO YOUR CERTIFICATE FOLDER PATH ***
+
+# Certificate file paths - these will be combined with BASE_FOLDER above
+CERT_FILES = {
+    "cer_file": 'public 9.cer',           # Your .cer file name
+    "private_key_file": 'private 9.key',  # Your .key file name  
+    "public_key_file": 'public_key 1.pem' # Your .pem file name
+}
+
+# Full certificate paths (automatically generated)
+CERT_PATHS = {
+    "cer_path": os.path.join(BASE_FOLDER, CERT_FILES["cer_file"]),
+    "private_key_path": os.path.join(BASE_FOLDER, CERT_FILES["private_key_file"]),
+    "public_key_path": os.path.join(BASE_FOLDER, CERT_FILES["public_key_file"])
+}
+
+# ========================================
+# BNYM ELIZA CONFIGURATION
+# ========================================
+
 ELIZA_CONFIG = {
     "environment": "QA",  # Change to "PROD" or other environments as needed
     "model": "openai-gpt-4.1",
@@ -727,15 +1089,10 @@ ELIZA_CONFIG = {
     "max_tokens": 2000,
 }
 
-# Certificate paths for JWT authentication
-BASE_FOLDER = ""  # Set your base folder path here - MODIFY THIS
-CERT_PATHS = {
-    "cer_path": os.path.join(BASE_FOLDER, 'public 9.cer'),
-    "private_key_path": os.path.join(BASE_FOLDER, 'private 9.key'),
-    "public_key_path": os.path.join(BASE_FOLDER, 'public_key 1.pem')
-}
+# ========================================
+# APP CONFIGURATION
+# ========================================
 
-# App Configuration
 APP_CONFIG = {
     "page_title": "BDD Test Case Generator",
     "page_icon": "🧪",
@@ -752,6 +1109,58 @@ JIRA_COLUMNS = [
     "Issue Comments", 
     "acceptance criteria"
 ]
+
+# ========================================
+# VALIDATION FUNCTIONS
+# ========================================
+
+def validate_configuration():
+    """Validate that configuration is properly set up"""
+    errors = []
+    warnings = []
+
+    # Check if BASE_FOLDER is set
+    if not BASE_FOLDER or BASE_FOLDER.strip() == "":
+        errors.append("❌ BASE_FOLDER is not set. Please set the path to your certificate folder in config.py")
+        errors.append("   Example: BASE_FOLDER = '/home/user/certificates'")
+        return errors, warnings
+
+    # Check if BASE_FOLDER exists
+    if not os.path.exists(BASE_FOLDER):
+        errors.append(f"❌ Certificate folder does not exist: {BASE_FOLDER}")
+        errors.append("   Please create the folder or check the path.")
+        return errors, warnings
+
+    # Check if certificate files exist
+    missing_files = []
+    for cert_name, cert_path in CERT_PATHS.items():
+        if not os.path.exists(cert_path):
+            missing_files.append(f"   • {cert_name}: {cert_path}")
+
+    if missing_files:
+        errors.append("❌ Certificate files not found:")
+        errors.extend(missing_files)
+        errors.append("   Please ensure all certificate files are in the specified folder.")
+
+    # Check file permissions
+    for cert_name, cert_path in CERT_PATHS.items():
+        if os.path.exists(cert_path) and not os.access(cert_path, os.R_OK):
+            warnings.append(f"⚠️  Certificate file may not be readable: {cert_path}")
+
+    return errors, warnings
+
+def get_configuration_status():
+    """Get current configuration status for display"""
+    errors, warnings = validate_configuration()
+    return {
+        "base_folder": BASE_FOLDER,
+        "cert_paths": CERT_PATHS,
+        "eliza_config": ELIZA_CONFIG,
+        "validation_errors": errors,
+        "validation_warnings": warnings,
+        "is_valid": len(errors) == 0
+    }
+
 
 
 data_utils.py
@@ -1066,6 +1475,7 @@ class ExcelExporter:
 
 
 
+
 project_summary.md
 # BDD Test Case Generator - BNYM Eliza Version
 
@@ -1211,157 +1621,188 @@ All using your specific BNYM Eliza integration code!
 
 
 readme.md
-# BDD Test Case Generator - BNYM Eliza Version
+# BDD Test Case Generator - BNYM Eliza Version (Enhanced)
 
 A powerful Streamlit application that automatically generates Behavior-Driven Development (BDD) test cases from Jira ticket exports using BNYM Eliza AI service.
 
-## Features
+## 🚨 IMPORTANT - First Time Setup
 
-- 🚀 **BNYM Eliza Integration** - Uses internal BNY Mellon AI service with JWT authentication
-- 📊 **Excel Processing** - Smart parsing of Jira Excel exports with field mapping
-- 🧪 **BDD Format** - Generates test cases in proper .feature file format
-- 💬 **Interactive Comments** - Add feedback and regenerate specific test cases
-- 📤 **Professional Export** - Export to formatted Excel with proper styling
-- 🔧 **Simple Configuration** - All settings in one config file
-- 🔐 **Secure Authentication** - Certificate-based JWT authentication
+**If you're getting "BNYM Eliza not initialized" error, follow these steps:**
+
+### 1. Configure Certificate Paths
+
+**MUST DO:** Edit the `config.py` file and set your certificate folder path:
+
+```python
+# In config.py, find this line and update it:
+BASE_FOLDER = ""  # ⚠️ CHANGE THIS
+
+# Change it to your actual certificate folder path:
+BASE_FOLDER = "/path/to/your/certificates"  # ✅ Example
+
+# Windows example:
+BASE_FOLDER = "C:\\Users\\YourName\\Documents\\certificates"
+
+# Linux/Mac example:  
+BASE_FOLDER = "/home/username/certificates"
+```
+
+### 2. Verify Certificate Files
+
+Ensure these files exist in your certificate folder:
+- `public 9.cer`
+- `private 9.key` 
+- `public_key 1.pem`
+
+### 3. Check File Permissions
+
+Make sure the certificate files are readable by your application.
 
 ## Quick Start
 
-### 1. Prerequisites
-
-- Access to BNYM internal network
-- BNYM Eliza certificates (public.cer, private.key, public_key.pem)
-- Python 3.8+ environment
-
-### 2. Installation
+### Installation
 
 ```bash
-# Clone or download the application files
 cd test_case_generator
 
-# Install dependencies (internal BNYM packages require special setup)
+# Install dependencies (may require internal BNYM setup)
 pip install -r requirements.txt
 ```
 
-### 3. Configuration
+### Configuration
 
-**IMPORTANT:** Edit `config.py` to set your certificate paths:
+**Edit `config.py`:**
 
 ```python
-# Certificate paths - MODIFY THESE PATHS
-BASE_FOLDER = "/path/to/your/certificates"  # Set your certificate folder path
-CERT_PATHS = {
-    "cer_path": os.path.join(BASE_FOLDER, 'public 9.cer'),
-    "private_key_path": os.path.join(BASE_FOLDER, 'private 9.key'),
-    "public_key_path": os.path.join(BASE_FOLDER, 'public_key 1.pem')
-}
+# Set your certificate folder path
+BASE_FOLDER = "/path/to/your/certificates"  # ⚠️ REQUIRED
 
-# Eliza Configuration
+# Configure environment (usually QA)
 ELIZA_CONFIG = {
-    "environment": "QA",  # Change to "PROD" as needed
-    "model": "openai-gpt-4.1",
-    "temperature": 0.7,
-    "max_tokens": 2000,
+    "environment": "QA",  # or "PROD"
+    "model": "openai-gpt-4.1"
 }
 ```
 
-### 4. Run the Application
+### Run Application
 
 ```bash
 streamlit run app.py
 ```
 
-The application will open in your browser at `http://localhost:8501`
+## Troubleshooting Common Issues
 
-## BNYM Eliza Integration
+### ❌ "BNYM Eliza not initialized"
 
-This version uses your specific BNYM Eliza integration code:
+**Cause:** Certificate configuration not set up
+
+**Solutions:**
+1. **Set BASE_FOLDER** in `config.py` to your certificate folder path
+2. **Verify certificate files exist** at the specified path
+3. **Check file permissions** - ensure files are readable
+4. **Restart the application** after making changes
+
+### ❌ "Certificate file not found"
+
+**Cause:** Certificate files missing or path incorrect
+
+**Solutions:**
+1. **Check file names** - must be exactly:
+   - `public 9.cer`
+   - `private 9.key`
+   - `public_key 1.pem`
+2. **Verify folder path** in BASE_FOLDER setting
+3. **Check file locations** - files must be in the BASE_FOLDER directory
+
+### ❌ "Failed to generate JWT Token"
+
+**Cause:** Certificate files invalid or corrupted
+
+**Solutions:**
+1. **Re-download certificates** from BNYM IT
+2. **Check file permissions** - ensure readable by application
+3. **Verify certificate validity** - ensure not expired
+4. **Contact BNYM IT** for new certificates if needed
+
+### ❌ "Connection failed" / "Network error"
+
+**Cause:** Cannot connect to BNYM Eliza service
+
+**Solutions:**
+1. **Check VPN connection** - ensure connected to BNYM network
+2. **Verify environment setting** - QA vs PROD in config
+3. **Check service availability** - contact BNYM Eliza support
+4. **Network permissions** - ensure access to internal services
+
+### ❌ "Module not found" / "Import error"
+
+**Cause:** BNYM Eliza packages not installed
+
+**Solutions:**
+1. **Contact BNYM IT** for package installation help
+2. **Check Python environment** - ensure using correct environment
+3. **Verify internal repository access** - may need special setup
+
+## Configuration Reference
+
+### Certificate Configuration
 
 ```python
-import bnym_eliza as eliza
-from bnym_eliza_utils import init_logger, get_jwt_from_certs
+# config.py
+BASE_FOLDER = "/your/certificate/path"  # REQUIRED
 
-# JWT Authentication
-jwt_token = get_jwt_from_certs(CER_PATH, PRIVATE_KEY_PATH)
-eliza.session = eliza.Session.connect(env='QA', jwt_token=jwt_token)
-
-# Generate test cases
-response = eliza.ChatCompletion.create(
-    model="openai-gpt-4.1",
-    messages=[{"role":"user", "content": prompt}]
-)
+CERT_FILES = {
+    "cer_file": 'public 9.cer',           # Certificate file name
+    "private_key_file": 'private 9.key',  # Private key file name  
+    "public_key_file": 'public_key 1.pem' # Public key file name
+}
 ```
+
+### Eliza Configuration
+
+```python
+ELIZA_CONFIG = {
+    "environment": "QA",        # BNYM environment (QA/PROD)
+    "model": "openai-gpt-4.1",  # AI model to use
+    "temperature": 0.7,         # Response creativity (0.0-1.0)
+    "max_tokens": 2000,         # Maximum response length
+}
+```
+
+## Features
+
+- 🔐 **Secure Authentication** - JWT certificate-based auth with BNYM Eliza
+- 📊 **Smart Excel Processing** - Automatic Jira field extraction and validation
+- 🧪 **BDD Format Generation** - Professional .feature file format output
+- 💬 **Interactive Refinement** - Comment-based test case improvement
+- 📤 **Professional Export** - Formatted Excel with proper styling
+- 🔧 **Enhanced Error Handling** - Clear error messages and troubleshooting help
+- 📋 **Configuration Validation** - Automatic validation of setup requirements
 
 ## How to Use
 
-### 1. Prepare Jira Export
-- Navigate to your Jira project
-- Go to **Issues** → **Search for issues**
-- Click **Export** → **Excel (All fields)**
+### 1. Setup Configuration
+- Edit `config.py` and set BASE_FOLDER to your certificate path
+- Ensure certificate files are in the specified folder
+- Choose appropriate environment (QA/PROD)
+
+### 2. Export from Jira
+- Go to Jira project → Issues → Search for issues
+- Click "Export" → "Excel (All fields)"
 - Download the Excel file
 
-### 2. Upload and Process
-- Use the file uploader in the application
-- The system will automatically extract these required fields:
-  - Project
-  - Key  
-  - Summary
-  - Description
-  - Issue Comments
-  - Acceptance Criteria
-
 ### 3. Generate Test Cases
-- Click "Generate Test Cases"  
-- Each Jira ticket will produce comprehensive BDD test scenarios using BNYM Eliza
-- Test cases are generated in .feature file format
+- Upload Jira Excel file in the application
+- Review extracted data preview
+- Click "Generate Test Cases" using BNYM Eliza
+- Review and refine generated test cases
 
-### 4. Review and Refine
-- Review generated test cases
-- Add comments for improvements
-- Click "Regenerate" to modify specific test cases using Eliza
-
-### 5. Export Results
-- Download professionally formatted Excel file
-- Contains all test cases, comments, and revision history
-
-## Architecture
-
-### Simplified Design for BNYM Eliza
-```
-test_case_generator/
-├── config.py              # Configuration settings (MODIFY THIS)
-├── app.py                 # Main Streamlit application
-├── data_utils.py          # Excel processing and export utilities
-├── requirements.txt       # Python dependencies  
-└── llm_clients/          # BNYM Eliza client only
-    ├── __init__.py
-    ├── eliza_client.py    # BNYM Eliza implementation
-    └── factory.py         # Simplified factory for Eliza
-```
-
-### Key Components
-
-- **ElizaClient**: Handles JWT authentication and Eliza API calls
-- **LLMManager**: Provides unified interface for test case generation
-- **JiraDataProcessor**: Processes Excel files and extracts required fields
-- **ExcelExporter**: Creates formatted Excel output with proper styling
-
-## Configuration Options
-
-### BNYM Eliza Settings
-- **environment**: Eliza environment ("QA", "PROD")
-- **model**: Model to use ("openai-gpt-4.1")
-- **temperature**: Creativity level (0.0-1.0)  
-- **max_tokens**: Maximum response length
-
-### Certificate Paths
-- **cer_path**: Path to public certificate (.cer file)
-- **private_key_path**: Path to private key (.key file)
-- **public_key_path**: Path to public key (.pem file)
+### 4. Export Results
+- Add comments to improve specific test cases
+- Regenerate test cases based on feedback
+- Export final results to formatted Excel
 
 ## Sample Output
-
-The application generates BDD test cases in this format:
 
 ```gherkin
 Feature: User Login Functionality
@@ -1382,64 +1823,49 @@ Feature: User Login Functionality
     And user should remain on login page
 ```
 
-## Troubleshooting
+## Architecture
 
-### Common Issues
+### Enhanced Error Handling
+- Configuration validation before initialization
+- Clear error messages with specific solutions
+- Step-by-step troubleshooting guides
+- Automatic certificate file verification
 
-**Certificate/JWT Errors**
-- Verify certificate paths in `config.py`
-- Check that certificates are valid and not expired
-- Ensure you have access to BNYM internal network
-- Verify certificate file permissions
+### BNYM Eliza Integration
+```python
+# Your exact integration pattern:
+import bnym_eliza as eliza
+from bnym_eliza_utils import init_logger, get_jwt_from_certs
 
-**BNYM Eliza Connection Issues**
-- Check network connectivity to BNYM services
-- Verify environment setting (QA vs PROD)
-- Ensure JWT token generation is working
-- Check Eliza service availability
+jwt_token = get_jwt_from_certs(cer_path, private_key_path)
+eliza.session = eliza.Session.connect(env='QA', jwt_token=jwt_token)
 
-**File Processing Errors**
-- Use "Excel (All fields)" export from Jira
-- Ensure the Excel file contains the required columns
-- Check file format (.xlsx or .xls)
-
-**Missing Dependencies**
-```bash
-# May require internal BNYM package installation procedures
-pip install -r requirements.txt
+response = eliza.ChatCompletion.create(
+    model="openai-gpt-4.1",
+    messages=[{"role": "user", "content": prompt}]
+)
 ```
-
-### Debug Mode
-Add logging configuration for debugging:
-```python  
-import logging
-logging.basicConfig(level=logging.DEBUG)
-```
-
-## Security Notes
-
-- Certificate files contain sensitive authentication information
-- Never commit certificate files to version control
-- Store certificates in secure locations with proper file permissions
-- Use appropriate environment settings (QA vs PROD)
 
 ## Support
 
-For issues specific to BNYM Eliza integration:
-- Contact BNYM Eliza support team
-- Check internal documentation for Eliza service
-- Verify certificate and network requirements
+### For Configuration Issues:
+1. Check this README troubleshooting section
+2. Verify certificate files and paths
+3. Restart application after configuration changes
 
-For application issues:
-- Check the troubleshooting section
-- Review configuration settings
-- Ensure all dependencies are installed
+### For BNYM Eliza Service Issues:
+1. Contact BNYM Eliza support team
+2. Check internal service status pages  
+3. Verify network/VPN connectivity
+
+### For Application Issues:
+1. Check error messages in the UI
+2. Look at troubleshooting guides provided
+3. Try refreshing the page/restarting app
 
 ---
 
-**Built for BNY Mellon using BNYM Eliza AI Service**
-
-
+**Built for BNY Mellon using BNYM Eliza AI Service with Enhanced Error Handling**
 
 
 requirements.txt
@@ -1466,6 +1892,36 @@ colorlog>=6.7.0
 
 # Note: BNYM Eliza packages are internal and may require 
 # special installation procedures or access to internal repositories
+
+
+
+
+
+2nd
+# Core dependencies
+streamlit>=1.28.0
+pandas>=1.5.0
+openpyxl>=3.1.0
+
+# BNYM Eliza dependencies (internal packages)
+bnym_eliza
+bnym_eliza_utils
+
+# Optional: For better Excel handling
+xlrd>=2.0.0
+
+# Optional: For enhanced logging
+colorlog>=6.7.0
+
+# Development dependencies (uncomment for development)
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+# black>=22.0.0
+# flake8>=5.0.0
+
+# Note: BNYM Eliza packages are internal and may require 
+# special installation procedures or access to internal repositories
+
 
 
 
