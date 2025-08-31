@@ -1,176 +1,25 @@
-import sys
-import subprocess
-import time
-import json
-import requests
-from datetime import datetime
+from pypdf import PdfReader, PdfWriter
 
-# Configuration
-URL_AUTH = "https:///token"
-URL_PROCESSING = "https:///triggerMailBox"
-URL_API = "https:///profiles/{processUid}"
-USERNAME = ""
-PASSWORD = ""
-BODY = "t"
-PFX_PATH = ""
-PFX_PASSPHRASE = ""
-VERIFY_SSL = True
+# Read the original PDF
+reader = PdfReader("fw8bene.pdf")
+writer = PdfWriter()
 
-# Test Configuration
-TOKEN_REFRESH_TIME = 20  # seconds
-POLLING_TIMEOUT = 300  # seconds (5 minutes)
-POLLING_INTERVAL = 5  # seconds
+# Get form fields to analyze structure
+fields = reader.get_fields()
+for field_name, field_info in fields.items():
+    print(f"Field: {field_name}, Type: {field_info.get('/FT')}")
 
-def ensure_requests_pkcs12():
-    try:
-        import requests_pkcs12
-        return requests_pkcs12
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
-        import requests_pkcs12
-        return requests_pkcs12
+# Fill form with data
+form_data = {
+    "organization_name": "ABC Corporation Ltd",
+    "country_incorporation": "India",
+    "foreign_tin": "ABCDE1234F"
+}
 
-class TestRunner:
-    def __init__(self):
-        self.requests_pkcs12 = ensure_requests_pkcs12()
-        self.token = None
-        self.token_timestamp = 0
-        self.refresh_counter = 0
-    
-    def _fetch_new_token(self):
-        data = {"grant_type": "client_credentials"}
-        try:
-            response = self.requests_pkcs12.post(
-                URL_AUTH,
-                auth=(USERNAME, PASSWORD),
-                data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            response.raise_for_status()
-            return response.json().get("access_token")
-        except Exception as e:
-            print(f"Token generation failed: {str(e)}")
-            return None
+# Update form fields and save
+writer.append(reader)
+for page in writer.pages:
+    writer.update_page_form_field_values(page, form_data)
 
-    def get_token(self):
-        current_time = time.time()
-        if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
-            self.token = self._fetch_new_token()
-            self.token_timestamp = current_time
-            self.refresh_counter += 1
-            print(f"New token generated (Total refreshes: {self.refresh_counter})")
-        return self.token
-    
-    def generate_process_id(self, token):
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        try:
-            response = self.requests_pkcs12.post(
-                URL_PROCESSING,
-                headers=headers,
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            response.raise_for_status()
-            return response.json().get("processUid")
-        except Exception as e:
-            print(f"ProcessID generation failed: {str(e)}")
-            return None
-
-    def check_api_status(self, token, process_id):
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        start_time = time.time()
-        elapsed = 0
-        
-        while elapsed < POLLING_TIMEOUT:
-            current_token = self.get_token()
-            headers["Authorization"] = f"Bearer {current_token}"
-            
-            try:
-                response = self.requests_pkcs12.get(
-                    URL_API.format(processUid=process_id),
-                    headers=headers,
-                    pkcs12_filename=PFX_PATH,
-                    pkcs12_password=PFX_PASSPHRASE,
-                    verify=VERIFY_SSL,
-                    timeout=30
-                )
-                current_time = time.time()
-                elapsed = current_time - start_time
-                
-                if response.status_code == 200:
-                    json_response = response.json()
-                    
-                    # Check if content exists and has status
-                    if 'content' in json_response and 'status' in json_response['content']:
-                        status = json_response['content']['status']
-                        if status == 'Completed':
-                            return {
-                                "http_status": f"{response.status_code} {response.reason}",
-                                "response_time": elapsed,
-                                "content_status": status,
-                                "process_completed": True
-                            }
-                        else:
-                            print(f"Current status: {status}, retrying in {POLLING_INTERVAL}s (Elapsed: {elapsed:.2f}s)")
-                    else:
-                        print("Response missing content or status, retrying...")
-                else:
-                    print(f"Non-200 response: {response.status_code} {response.reason}, retrying in {POLLING_INTERVAL}s")
-                
-                time.sleep(POLLING_INTERVAL)
-                
-            except Exception as e:
-                print(f"API call failed: {str(e)}, retrying in {POLLING_INTERVAL}s")
-                time.sleep(POLLING_INTERVAL)
-                elapsed = time.time() - start_time
-        
-        return {
-            "http_status": "Error: Timeout waiting for Completed status",
-            "response_time": elapsed,
-            "content_status": "Timeout",
-            "process_completed": False
-        }
-
-    def run_test(self):
-        print(" Starting test for a single process...")
-        start_time = time.time()
-        
-        try:
-            token = self.get_token()
-            if not token:
-                raise ValueError("Token generation failed")
-            
-            process_id = self.generate_process_id(token)
-            if not process_id:
-                raise ValueError("Process ID generation failed")
-            
-            result = self.check_api_status(token, process_id)
-            
-            print(f"\n=== TEST RESULTS ===")
-            print(f"Process ID: {process_id}")
-            print(f"HTTP Status: {result['http_status']}")
-            print(f"Response Time: {result['response_time']:.2f}s")
-            print(f"Content Status: {result['content_status']}")
-            
-            if result['process_completed']:
-                print("\n Process completed successfully")
-            else:
-                print("\n Process did not complete successfully")
-            
-        except Exception as e:
-            print(f"\n Test failed: {str(e)}")
-        
-        test_duration = time.time() - start_time
-        print("\n=== TEST COMPLETE ===")
-        print(f"Total duration: {test_duration:.2f}s")
-        print(f"Total token refreshes: {self.refresh_counter}")
-
-if __name__ == "__main__":
-    test = TestRunner()
-    test.run_test()
+with open("filled_w8bene.pdf", "wb") as output_file:
+    writer.write(output_file)
