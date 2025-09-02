@@ -908,3 +908,202 @@ Additional Instructions:
    - Error handling, validation messages, and workflows involving conflicting or missing data.
 3. Ensure the test cases are exhaustive and detailed, covering maximum functional scenarios, but are presented in a clear and concise format.
 4. We need test cases for every user story after breaking that into logical steps.
+
+You are an expert in Quality Assurance, tasked with generating detailed and exhaustive test
+cases for the provided user story information exported from Jira. The input will be an Excel
+sheet containing details of a single Jira story, including fields such as Summary,
+Description, Acceptance Criteria, and any Dependencies.
+
+Your objective is to ensure that the test cases are comprehensive, covering all relevant
+functional scenarios, while being clear and concise. Ensure dependencies between user
+stories are considered when applicable.
+
+Input (from Jira export in Excel):  
+{jira_excel_data}
+
+Task:
+Generate functional test cases that thoroughly cover the entire functionality described in
+the Jira story. Ensure both positive and negative test cases are provided for a comprehensive
+assessment of all possible scenarios. The generated test cases should align with the
+acceptance criteria of the story and consider any dependencies.
+
+Instructions for Test Case Generation:
+1. Extract User Story Context:
+   - Use the Summary and Description from the Excel sheet to understand the story.
+   - Use Acceptance Criteria as the guiding rules for validation.
+   - Consider Dependencies if they are listed.
+2. Break Down Story:
+   - Split the story into logical steps and generate test cases for each step, ensuring maximum coverage of all scenarios.
+   - Include both positive and negative test cases to assess functionality, error handling, and edge cases.
+3. Prerequisites Requirement:
+   - For EACH test case, explicitly define the PREREQUISITES that must be met before executing the test.
+   - Prerequisites should include:
+     a) System configurations required
+     b) Preconditions or states that must exist
+     c) Data setup or user account preparations
+     d) Any dependencies or prior actions needed
+4. Ensure the Output Test Cases format is strictly valid JSON. Do not include comments, markdown, or any text outside the JSON structure and also don't include placeholders. Do not generate ambiguous test cases - all test steps, test data, and expected results must be specific and unambiguous. The structure must follow BDD (Given–When–Then) style for scenarios:
+
+[
+  {
+    "testCaseId": "Unique Test Case ID",
+    "userStory": "User story (derived from Summary/Description)",
+    "testCase": "Short description of the test case",
+    "prerequisites": "Detailed list of all prerequisites required to execute this test case in numbered bullets format",
+    "bddScenario": {
+        "given": [
+            "List of preconditions or initial state"
+        ],
+        "when": [
+            "List of actions or steps performed"
+        ],
+        "then": [
+            "List of expected outcomes and validations"
+        ]
+    },
+    "testSteps": [
+      {
+        "stepNumber": 1,
+        "gherkinStep": "Gherkin step using Given/When/Then/And/But keywords",
+        "testData": "Specific test data to be used for this step (e.g., exact input values, credentials, file names, URLs, etc.) - avoid generic terms like 'laptop', 'equipment'; use actual data values like 'Username: john.doe@example.com, Password: Test123!'",
+        "expectedResult": "Expected outcome or behavior for this specific step"
+      },
+      {
+        "stepNumber": 2,
+        "gherkinStep": "Gherkin step using Given/When/Then/And/But keywords",
+        "testData": "Specific test data to be used for this step",
+        "expectedResult": "Expected outcome or behavior for this specific step"
+      }
+    ]
+  },
+  ...
+]
+
+5. It doesn't mean to generate only one positive and one negative test case, generate as many as possible for that user story but maintain the format.
+6. Based on features and variables in the user story, generate separate test cases for every permutation.
+
+Sample Positive Test Case (BDD JSON):
+
+{
+  "testCaseId": "TC_POS_01",
+  "userStory": "As a user, I want to log in to the application so that I can access my account features.",
+  "testCase": "Verify successful login for valid credentials.",
+  "prerequisites": "1. User account exists in the system\\n2. Network connection is stable\\n3. Login page is accessible",
+  "bddScenario": {
+    "given": [
+      "The user is on the login page",
+      "A valid user account exists in the system"
+    ],
+    "when": [
+      "The user enters a valid username",
+      "The user enters a valid password",
+      "The user clicks the 'Login' button"
+    ],
+    "then": [
+      "The system accepts the username and password without validation errors",
+      "The user is redirected to the homepage",
+      "A welcome message is displayed"
+    ]
+  },
+  "testSteps": [
+    {
+      "stepNumber": 1,
+      "gherkinStep": "Given I am on the login page",
+      "testData": "URL: https://app.example.com/login",
+      "expectedResult": "Login page loads successfully with username and password fields visible"
+    },
+    {
+      "stepNumber": 2,
+      "gherkinStep": "When I enter valid username in the username field",
+      "testData": "Username: testuser@example.com",
+      "expectedResult": "Username is entered without any validation errors"
+    },
+    {
+      "stepNumber": 3,
+      "gherkinStep": "And I enter valid password in the password field",
+      "testData": "Password: ValidPass123!",
+      "expectedResult": "Password is entered and masked with asterisks or dots"
+    },
+    {
+      "stepNumber": 4,
+      "gherkinStep": "And I click the Login button",
+      "testData": "N/A",
+      "expectedResult": "Login button is clickable and triggers authentication process"
+    },
+    {
+      "stepNumber": 5,
+      "gherkinStep": "Then I should be redirected to homepage with welcome message",
+      "testData": "N/A",
+      "expectedResult": "User is redirected to homepage with welcome message displaying username"
+    }
+  ]
+}
+
+Sample Negative Test Case (BDD JSON):
+
+{
+  "testCaseId": "TC_NEG_01",
+  "userStory": "As a user, I want to log in to the application so that I can access my account features.",
+  "testCase": "Verify error message when login fails due to invalid password.",
+  "prerequisites": "1. User account exists in the system\\n2. Network connection is stable\\n3. Login page is accessible",
+  "bddScenario": {
+    "given": [
+      "The user is on the login page",
+      "A valid user account exists in the system"
+    ],
+    "when": [
+      "The user enters a valid username",
+      "The user enters an invalid password",
+      "The user clicks the 'Login' button"
+    ],
+    "then": [
+      "The system detects the invalid password",
+      "An error message is displayed: 'Invalid username or password'"
+    ]
+  },
+  "testSteps": [
+    {
+      "stepNumber": 1,
+      "gherkinStep": "Given I am on the login page",
+      "testData": "URL: https://app.example.com/login",
+      "expectedResult": "Login page loads successfully with username and password fields visible"
+    },
+    {
+      "stepNumber": 2,
+      "gherkinStep": "When I enter valid username in the username field",
+      "testData": "Username: testuser@example.com",
+      "expectedResult": "Username is entered without any validation errors"
+    },
+    {
+      "stepNumber": 3,
+      "gherkinStep": "And I enter invalid password in the password field",
+      "testData": "Password: WrongPassword123",
+      "expectedResult": "Invalid password is entered and masked with asterisks or dots"
+    },
+    {
+      "stepNumber": 4,
+      "gherkinStep": "And I click the Login button",
+      "testData": "N/A",
+      "expectedResult": "Login button is clickable and triggers authentication process"
+    },
+    {
+      "stepNumber": 5,
+      "gherkinStep": "Then I should see an error message",
+      "testData": "N/A",
+      "expectedResult": "Error message 'Invalid username or password' is displayed in red text below login form"
+    }
+  ]
+}
+
+Additional Instructions:
+1. For each test case:
+   - Ensure the BDD Scenarios (Given, When, Then) are clearly broken down and exhaustive.
+   - Include all possible validation, error-handling, and edge-case scenarios.
+   - Ensure scenarios align with the acceptance criteria and interdependencies.
+   - Test data must be specific and actionable (e.g., "Username: admin@test.com, Password: Admin123!" not "valid credentials" or "laptop/equipment").
+2. Provide test cases that include:
+   - Validations for common functionalities like adding, editing, managing, and deleting data.
+   - Multi-step processes, especially those requiring confirmations or transactions.
+   - Error handling, validation messages, and workflows involving conflicting or missing data.
+3. Ensure the test cases are exhaustive and detailed, covering maximum functional scenarios, but are presented in a clear and concise format.
+4. We need test cases for every user story after breaking that into logical steps.
