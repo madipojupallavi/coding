@@ -1,25 +1,32 @@
-from pypdf import PdfReader, PdfWriter
+from fillpdf import fillpdfs
 
-# Read the original PDF
-reader = PdfReader("fw8bene.pdf")
-writer = PdfWriter()
+# Path to your blank W-8BEN-E form PDF
+form_pdf_path = r"C:/Users/user/Downloads/fw8bene.pdf"  
 
-# Get form fields to analyze structure
-fields = reader.get_fields()
-for field_name, field_info in fields.items():
-    print(f"Field: {field_name}, Type: {field_info.get('/FT')}")
+# Step 1: Extract all field names from the PDF form (run once to know all PDF field keys)
+fields = fillpdfs.get_form_fields(form_pdf_path)
+print("PDF Form Fields and current values:")
+for k, v in fields.items():
+    print(f"{k}: {v}")
 
-# Fill form with data
-form_data = {
-    "organization_name": "ABC Corporation Ltd",
-    "country_incorporation": "India",
-    "foreign_tin": "ABCDE1234F"
+# Step 2: Prepare mapping of your JSON data fields to the exact PDF form fields (update after inspecting output above)
+data_dict = {
+    'f1_01(0)': "Aurelxia Pharma GmbH",                       # Name of organization (Check exact field name after extraction)
+    'f1_02(0)': "Germany",                                   # Country of incorporation or organization
+    'f1_06(0)': "Konrad-Adenauer-Strasse 22, 50668 Köln, Germany",  # Permanent residence address
+    'f1_08(0)': "",                                          # US TIN (empty in the example)
+    'f1_09(0)': "DE316953228",                               # Foreign TIN
+    'f1_33(0)': "Ilona Behringer",                           # Signature (printed name)
+    'f1_34(0)': "06-12-2024",                               # Date signed, format MM-DD-YYYY
+    # Add any other fields as seen in the extraction
 }
 
-# Update form fields and save
-writer.append(reader)
-for page in writer.pages:
-    writer.update_page_form_field_values(page, form_data)
+# Step 3: Fill the PDF form with the mapped data and save output
+output_filled_pdf = "W8BEN-E_filled.pdf"
+fillpdfs.write_fillable_pdf(form_pdf_path, output_filled_pdf, data_dict)
 
-with open("filled_w8bene.pdf", "wb") as output_file:
-    writer.write(output_file)
+# Optional: Flatten PDF so that fields are no longer editable
+fillpdfs.flatten_pdf(output_filled_pdf, "W8BEN-E_filled_flattened.pdf")
+
+print(f"Filled PDF saved as {output_filled_pdf}")
+print(f"Flattened PDF saved as W8BEN-E_filled_flattened.pdf")
