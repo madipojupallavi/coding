@@ -1107,3 +1107,73 @@ Additional Instructions:
    - Error handling, validation messages, and workflows involving conflicting or missing data.
 3. Ensure the test cases are exhaustive and detailed, covering maximum functional scenarios, but are presented in a clear and concise format.
 4. We need test cases for every user story after breaking that into logical steps.
+
+
+
+# from pypdf import PdfReader
+
+# reader = PdfReader("W8.pdf")
+# fields = reader.get_fields()
+# if fields:
+#     print("Found:")
+#     for k in fields.keys():
+#         print(k)
+# else:
+#     print("not found")
+from pypdf import PdfReader, PdfWriter
+
+def fill_pdf_form(input_pdf_path, output_pdf_path, field_data):
+    """
+    Fill PDF form fields and save to a new file
+    
+    Args:
+        input_pdf_path (str): Path to the input PDF file
+        output_pdf_path (str): Path where the filled PDF will be saved
+        field_data (dict): Dictionary with field names as keys and values to fill
+    """
+    
+    # Read the PDF
+    reader = PdfReader(input_pdf_path)
+    writer = PdfWriter()
+    
+    # Clone reader to writer
+    writer.clone_reader_document_root(reader)
+    
+    # Fill the form fields
+    if writer.get_fields():
+        for field_name, field_value in field_data.items():
+            writer.update_page_form_field_values(
+                writer.pages[0], {field_name: field_value}
+            )
+    else:
+        print("No form fields found in the PDF")
+        return False
+    
+    # Save the filled PDF
+    with open(output_pdf_path, 'wb') as output_file:
+        writer.write(output_file)
+    
+    print(f"PDF successfully filled and saved as: {output_pdf_path}")
+    return True
+
+# Define the data to fill in the form
+field_data = {
+    "topmostSubform[0].Page1[0].f1_1[0]": "hello this is palllavik",
+    "topmostSubform[0].Page1[0].f1_2[0]": "hyd"
+}
+
+# Fill the PDF form
+if __name__ == "__main__":
+    input_pdf = "W8.pdf"
+    output_pdf = "W8_filled.pdf"
+    
+    try:
+        success = fill_pdf_form(input_pdf, output_pdf, field_data)
+        if success:
+            print("Form filling completed successfully!")
+        else:
+            print("Form filling failed!")
+    except FileNotFoundError:
+        print(f"Error: Could not find the file '{input_pdf}'")
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
