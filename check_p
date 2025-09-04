@@ -1,569 +1,227 @@
-import sys
-import subprocess
-import time
-import statistics
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
-import requests
-import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import PatternFill, Font
-from openpyxl.utils import get_column_letter
-from datetime import datetime
-from pathlib import Path
-import os
-import math
+from pypdf import PdfReader, PdfWriter
+import re
 
-# Configuration
-URL_AUTH = "https:///token"
-URL_PROCESSING = "https:///triggerMailBox"
-URL_API = "https:///profiles/{processUid}"
-USERNAME = ""
-PASSWORD = ""
-BODY = "t"
-PFX_PATH = ""
-PFX_PASSPHRASE = ""
-VERIFY_SSL = True
+def get_page_number_from_field(field_name):
+    """
+    Extract page number from field name like 'topmostSubform[0].Page1[0].f1_1[0]'
+    Returns the page number (1-indexed) or None if not found
+    """
+    match = re.search(r'\.Page(\d+)\[', field_name)
+    if match:
+        return int(match.group(1))
+    return None
 
-# Test Configuration
-MAX_THREADS = 50    # Number of threads, each performing one flow
-TOKEN_REFRESH_TIME = 20  # seconds
-MAX_STATUS_CHECKS = 10  # Maximum number of times to check for "Completed" status
-STATUS_CHECK_INTERVAL = 2  # Seconds between status checks
-
-# Output Configuration
-OUTPUT_DIR = Path.cwd() / "performance_results"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_EXCEL = OUTPUT_DIR / f"API_Performance_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-
-def ensure_requests_pkcs12():
-    try:
-        import requests_pkcs12
-        return requests_pkcs12
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "requests_pkcs12"])
-        import requests_pkcs12
-        return requests_pkcs12
-
-class TokenManager:
-    def __init__(self, requests_pkcs12):
-        self.requests_pkcs12 = requests_pkcs12
-        self.token = None
-        self.token_timestamp = 0
-        self.lock = threading.Lock()
-        self.refresh_counter = 0
-        self.total_tokens_generated = 0
-        self.token_stats = []  # Store token generation metrics
+def group_fields_by_page(field_data):
+    """
+    Group field data by page number
+    """
+    page_fields = {}
     
-    def get_token(self):
-        with self.lock:
-            current_time = time.time()
-            if self.token is None or (current_time - self.token_timestamp) > TOKEN_REFRESH_TIME:
-                token_result = self._fetch_new_token()
-                if token_result["success"]:
-                    self.token = token_result["token"]
-                    self.token_timestamp = current_time
-                    self.refresh_counter += 1
-                    self.total_tokens_generated += 1
-                    print(f"New token generated (Total refreshes: {self.refresh_counter})")
-                return token_result
-            return {
-                "token": self.token,
-                "response_time": 0,
-                "request_size_bytes": 0,
-                "response_size_bytes": 0,
-                "success": True,
-                "from_cache": True
-            }
+    for field_name, field_value in field_data.items():
+        page_num = get_page_number_from_field(field_name)
+        if page_num is not None:
+            if page_num not in page_fields:
+                page_fields[page_num] = {}
+            page_fields[page_num][field_name] = field_value
+        else:
+            # If we can't determine the page, add to page 1 as fallback
+            if 1 not in page_fields:
+                page_fields[1] = {}
+            page_fields[1][field_name] = field_value
     
-    def _fetch_new_token(self):
-        data = {"grant_type": "client_credentials"}
-        try:
-            start_time = time.time()
-            response = self.requests_pkcs12.post(
-                URL_AUTH,
-                auth=(USERNAME, PASSWORD),
-                data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            elapsed = time.time() - start_time
-            
-            # Calculate request/response sizes
-            request_size = len(str(data)) + len(URL_AUTH) + len(USERNAME) + len(PASSWORD)
-            response_size = len(response.text)
-            
-            response.raise_for_status()
-            token_data = response.json()
-            
-            # Record the token generation metrics
-            token_result = {
-                "token": token_data.get("access_token"),
-                "response_time": elapsed,
-                "request_size_bytes": request_size,
-                "response_size_bytes": response_size,
-                "success": True,
-                "from_cache": False
-            }
-            
-            self.token_stats.append(token_result)
-            return token_result
-            
-        except Exception as e:
-            error_result = {
-                "token": None,
-                "response_time": 0,
-                "request_size_bytes": 0,
-                "response_size_bytes": 0,
-                "success": False,
-                "error": str(e),
-                "from_cache": False
-            }
-            self.token_stats.append(error_result)
-            print(f"Token generation failed: {str(e)}")
-            return error_result
+    return page_fields
 
-class TestRunner:
-    def __init__(self):
-        self.requests_pkcs12 = ensure_requests_pkcs12()
-        self.token_manager = TokenManager(self.requests_pkcs12)
-        self.results = []
-        self.processing_stats = []
-        self.api_stats = []
-        self.lock = threading.Lock()
-        self.completed_processes = 0
-        
-    def generate_process_id(self, token):
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        try:
-            start_time = time.time()
-            response = self.requests_pkcs12.get(
-                URL_PROCESSING,
-                headers=headers,
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            elapsed = time.time() - start_time
+def fill_pdf_form_smart(input_pdf_path, output_pdf_path, field_data):
+    """
+    Smart method: Group fields by page and update each page with its specific fields
+    """
+    reader = PdfReader(input_pdf_path)
+    writer = PdfWriter()
+    writer.clone_reader_document_root(reader)
+    
+    if not writer.get_fields():
+        print("No form fields found")
+        return False
+    
+    # Group fields by page
+    page_fields = group_fields_by_page(field_data)
+    print(f"Fields grouped by page: {list(page_fields.keys())}")
+    
+    fields_updated = 0
+    total_fields_attempted = 0
+    
+    # Update each page with its specific fields
+    for page_num, page in enumerate(writer.pages, 1):  # 1-indexed
+        if page_num in page_fields:
+            page_field_data = page_fields[page_num]
+            print(f"\nPage {page_num}: Attempting to update {len(page_field_data)} fields")
             
-            # Calculate request/response sizes
-            request_size = len(str(headers)) + len(URL_PROCESSING)
-            response_size = len(response.text)
+            for field_name, field_value in page_field_data.items():
+                print(f"  Updating: {field_name} = '{field_value}'")
+                total_fields_attempted += 1
             
-            response.raise_for_status()
-            process_id = response.json().get("processUid")
-            
-            with self.lock:
-                self.processing_stats.append({
-                    "process_id": process_id,
-                    "response_time": elapsed,
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size,
-                    "success": True
-                })
-            
-            return process_id
-        except Exception as e:
-            with self.lock:
-                self.processing_stats.append({
-                    "process_id": None,
-                    "response_time": 0,
-                    "request_size_bytes": 0,
-                    "response_size_bytes": 0,
-                    "success": False,
-                    "error": str(e)
-                })
-            print(f"ProcessID generation failed: {str(e)}")
-            return None
-
-    def check_api_status(self, token, process_id):
-        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-        try:
-            start_time = time.time()
-            response = self.requests_pkcs12.get(
-                URL_API.format(processUid=process_id),
-                headers=headers,
-                pkcs12_filename=PFX_PATH,
-                pkcs12_password=PFX_PASSPHRASE,
-                verify=VERIFY_SSL,
-                timeout=30
-            )
-            elapsed = time.time() - start_time
-            
-            # Calculate request/response sizes
-            request_size = len(str(headers)) + len(URL_API.format(processUid=process_id))
-            response_size = len(response.text)
-            
-            # First check if response is 200 OK
-            if response.status_code != 200:
-                with self.lock:
-                    self.api_stats.append({
-                        "process_id": process_id,
-                        "response_time": elapsed,
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size,
-                        "success": False,
-                        "error": f"{response.status_code} {response.reason}",
-                        "final_status": "HTTP Error"
-                    })
-                return {
-                    "status": f"{response.status_code} {response.reason}",
-                    "response_time": elapsed,
-                    "success": False,
-                    "final_status": "HTTP Error",
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size
-                }
-            
-            # If 200 OK, check the JSON response for status in content
             try:
-                response_json = response.json()
-                content_status = response_json.get("content", {}).get("status", "Unknown")
+                writer.update_page_form_field_values(page, page_field_data)
+                fields_updated += len(page_field_data)
+                print(f"  ✓ Successfully updated {len(page_field_data)} fields on page {page_num}")
+            except Exception as e:
+                print(f"  ✗ Error updating page {page_num}: {str(e)}")
+        else:
+            print(f"Page {page_num}: No fields to update")
+    
+    with open(output_pdf_path, 'wb') as output_file:
+        writer.write(output_file)
+    
+    print(f"\nSummary: Updated {fields_updated}/{total_fields_attempted} fields")
+    return True
+
+def test_checkbox_values_simple(input_pdf, checkbox_field):
+    """
+    Simple checkbox testing - try different values and see which ones work
+    """
+    test_values = ['/Yes', '/On', '/1', 'Yes', 'On', '1', 'True', '/True']
+    
+    print(f"\nTesting checkbox values for: {checkbox_field}")
+    print("-" * 50)
+    
+    for test_value in test_values:
+        try:
+            # Create test data with just this checkbox
+            test_data = {checkbox_field: test_value}
+            
+            # Try to fill the form
+            reader = PdfReader(input_pdf)
+            writer = PdfWriter()
+            writer.clone_reader_document_root(reader)
+            
+            page_fields = group_fields_by_page(test_data)
+            
+            for page_num, page in enumerate(writer.pages, 1):
+                if page_num in page_fields:
+                    writer.update_page_form_field_values(page, page_fields[page_num])
+            
+            # Check the result
+            fields = writer.get_fields()
+            if checkbox_field in fields:
+                actual_value = fields[checkbox_field].get('/V', 'None')
+                is_checked = actual_value != '/Off' and actual_value is not None
+                status = "✓ CHECKED" if is_checked else "✗ Not checked"
+                print(f"  {test_value:10} -> {actual_value:15} {status}")
                 
-                # If status is not Completed, poll until it is or max attempts reached
-                if content_status != "Completed":
-                    attempts = 1
-                    while attempts < MAX_STATUS_CHECKS and content_status != "Completed":
-                        time.sleep(STATUS_CHECK_INTERVAL)
-                        check_start = time.time()
-                        response = self.requests_pkcs12.get(
-                            URL_API.format(processUid=process_id),
-                            headers=headers,
-                            pkcs12_filename=PFX_PATH,
-                            pkcs12_password=PFX_PASSPHRASE,
-                            verify=VERIFY_SSL,
-                            timeout=30
-                        )
-                        check_elapsed = time.time() - check_start
-                        elapsed += check_elapsed  # Accumulate all check times
-                        
-                        # Accumulate request/response sizes
-                        request_size += len(str(headers)) + len(URL_API.format(processUid=process_id))
-                        response_size += len(response.text)
-                        
-                        if response.status_code != 200:
-                            with self.lock:
-                                self.api_stats.append({
-                                    "process_id": process_id,
-                                    "response_time": elapsed,
-                                    "request_size_bytes": request_size,
-                                    "response_size_bytes": response_size,
-                                    "success": False,
-                                    "error": f"Status check failed: {response.status_code} {response.reason}",
-                                    "final_status": "HTTP Error during polling"
-                                })
-                            return {
-                                "status": f"Status check failed: {response.status_code} {response.reason}",
-                                "response_time": elapsed,
-                                "success": False,
-                                "final_status": "HTTP Error during polling",
-                                "request_size_bytes": request_size,
-                                "response_size_bytes": response_size
-                            }
-                        
-                        response_json = response.json()
-                        content_status = response_json.get("content", {}).get("status", "Unknown")
-                        attempts += 1
+                if is_checked:
+                    return test_value  # Return the first working value
+            else:
+                print(f"  {test_value:10} -> Field not found")
                 
-                if content_status == "Completed":
-                    with self.lock:
-                        self.api_stats.append({
-                            "process_id": process_id,
-                            "response_time": elapsed,
-                            "request_size_bytes": request_size,
-                            "response_size_bytes": response_size,
-                            "success": True,
-                            "final_status": "Completed"
-                        })
-                    return {
-                        "status": f"200 OK - Completed",
-                        "response_time": elapsed,
-                        "success": True,
-                        "final_status": "Completed",
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size
-                    }
+        except Exception as e:
+            print(f"  {test_value:10} -> Error: {str(e)}")
+    
+    return None
+
+def verify_filled_pdf(pdf_path):
+    """
+    Verify if the PDF was actually filled, organized by page
+    """
+    print(f"\n=== VERIFYING FILLED PDF: {pdf_path} ===")
+    reader = PdfReader(pdf_path)
+    writer = PdfWriter()
+    writer.clone_reader_document_root(reader)
+    
+    fields = writer.get_fields()
+    if not fields:
+        print("No fields found in filled PDF")
+        return
+    
+    filled_by_page = {}
+    checkbox_count = {"checked": 0, "unchecked": 0}
+    
+    for field_name, field_obj in fields.items():
+        value = field_obj.get('/V', None)
+        if value:
+            page_num = get_page_number_from_field(field_name)
+            if page_num not in filled_by_page:
+                filled_by_page[page_num] = []
+            filled_by_page[page_num].append((field_name, value))
+            
+            # Count checkboxes
+            if '.c' in field_name:  # Checkbox field
+                if value == '/Off':
+                    checkbox_count["unchecked"] += 1
                 else:
-                    with self.lock:
-                        self.api_stats.append({
-                            "process_id": process_id,
-                            "response_time": elapsed,
-                            "request_size_bytes": request_size,
-                            "response_size_bytes": response_size,
-                            "success": False,
-                            "error": f"Final status: {content_status} (after {attempts} checks)",
-                            "final_status": f"Timeout - {content_status}"
-                        })
-                    return {
-                        "status": f"200 OK - Final status: {content_status} (after {attempts} checks)",
-                        "response_time": elapsed,
-                        "success": False,
-                        "final_status": f"Timeout - {content_status}",
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size
-                    }
-                    
-            except ValueError:  # JSON decode error
-                with self.lock:
-                    self.api_stats.append({
-                        "process_id": process_id,
-                        "response_time": elapsed,
-                        "request_size_bytes": request_size,
-                        "response_size_bytes": response_size,
-                        "success": False,
-                        "error": "Invalid JSON response",
-                        "final_status": "Invalid JSON"
-                    })
-                return {
-                    "status": "200 OK - Invalid JSON response",
-                    "response_time": elapsed,
-                    "success": False,
-                    "final_status": "Invalid JSON",
-                    "request_size_bytes": request_size,
-                    "response_size_bytes": response_size
-                }
-                
-        except Exception as e:
-            with self.lock:
-                self.api_stats.append({
-                    "process_id": process_id,
-                    "response_time": 0,
-                    "request_size_bytes": 0,
-                    "response_size_bytes": 0,
-                    "success": False,
-                    "error": str(e),
-                    "final_status": f"Exception: {str(e)}"
-                })
-            return {
-                "status": f"Error: {str(e)}",
-                "response_time": 0,
-                "success": False,
-                "final_status": f"Exception: {str(e)}",
-                "request_size_bytes": 0,
-                "response_size_bytes": 0
-            }
+                    checkbox_count["checked"] += 1
+    
+    if filled_by_page:
+        for page_num in sorted(filled_by_page.keys()):
+            print(f"\nPage {page_num} - Filled fields:")
+            for field_name, value in filled_by_page[page_num]:
+                # Show checkbox status more clearly
+                if '.c' in field_name:
+                    status = "CHECKED" if value != '/Off' else "unchecked"
+                    print(f"  {field_name} = {value} ({status})")
+                else:
+                    print(f"  {field_name} = '{value}'")
+    else:
+        print("No filled fields found")
+    
+    print(f"\nCheckbox Summary: {checkbox_count['checked']} checked, {checkbox_count['unchecked']} unchecked")
 
-    def worker(self):
-        try:
-            token_result = self.token_manager.get_token()
-            if not token_result or not token_result["token"]:
-                raise ValueError("Token generation failed")
-                
-            process_id = self.generate_process_id(token_result["token"])
-            if not process_id:
-                raise ValueError("Process ID generation failed")
-                
-            api_result = self.check_api_status(token_result["token"], process_id)
-            
-            with self.lock:
-                self.completed_processes += 1
-                self.results.append({
-                    "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "process_id": process_id,
-                    "api_status": api_result["status"],
-                    "response_time_sec": api_result["response_time"],
-                    "success": api_result["success"],
-                    "error_type": None if api_result["success"] else "HTTP",
-                    "final_status": api_result["final_status"],
-                    "request_size_bytes": api_result["request_size_bytes"],
-                    "response_size_bytes": api_result["response_size_bytes"],
-                    "token_response_time": token_result["response_time"],
-                    "token_success": token_result["success"]
-                })
-                print(f"[{self.completed_processes}] Process {process_id}: {api_result['status']} ({api_result['response_time']:.2f}s)")
-                
-            return api_result
-            
-        except Exception as e:
-            with self.lock:
-                self.completed_processes += 1
-                self.results.append({
-                    "token_generation_time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "process_id": None,
-                    "api_status": f"CRASH: {str(e)}",
-                    "response_time_sec": 0,
-                    "success": False,
-                    "error_type": "SILENT",
-                    "final_status": f"Crash: {str(e)}",
-                    "request_size_bytes": 0,
-                    "response_size_bytes": 0,
-                    "token_response_time": 0,
-                    "token_success": False
-                })
-            print(f"⚠️ Worker failed: {str(e)}")
-            return None
-
-    def calculate_metrics(self, data, time_field, size_field=None):
-        success_data = [d for d in data if d.get("success", False)]
-        success_times = [d[time_field] for d in success_data if time_field in d]
-        
-        metrics = {
-            "count": len(data),
-            "success_count": len(success_data),
-            "error_count": len(data) - len(success_data),
-            "error_rate": (len(data) - len(success_data)) / len(data) * 100 if len(data) > 0 else 0,
-            "avg": statistics.mean(success_times) if success_times else 0,
-            "min": min(success_times) if success_times else 0,
-            "max": max(success_times) if success_times else 0,
-            "median": statistics.median(success_times) if success_times else 0,
-            "p90": statistics.quantiles(success_times, n=10)[8] if len(success_times) >= 10 else 0,
-            "p95": statistics.quantiles(success_times, n=20)[18] if len(success_times) >= 20 else 0,
-            "p99": statistics.quantiles(success_times, n=100)[98] if len(success_times) >= 100 else 0,
-        }
-        
-        if size_field:
-            total_request_size = sum(d.get("request_size_bytes", 0) for d in data)
-            total_response_size = sum(d.get("response_size_bytes", 0) for d in data)
-            metrics.update({
-                "total_request_kb": total_request_size / 1024,
-                "total_response_kb": total_response_size / 1024,
-                "avg_request_kb": (total_request_size / len(data)) / 1024 if len(data) > 0 else 0,
-                "avg_response_kb": (total_response_size / len(data)) / 1024 if len(data) > 0 else 0,
-            })
-        
-        return metrics
-
-    def generate_report(self, test_duration):
-        try:
-            print(f"\n📊 Generating comprehensive report at: {OUTPUT_EXCEL}")
-            
-            # Calculate metrics for each endpoint
-            token_metrics = self.calculate_metrics(self.token_manager.token_stats, "response_time", "request_size_bytes")
-            processing_metrics = self.calculate_metrics(self.processing_stats, "response_time", "request_size_bytes")
-            api_metrics = self.calculate_metrics(self.api_stats, "response_time", "request_size_bytes")
-            
-            # Calculate throughput and KB/sec for each endpoint
-            for metrics in [token_metrics, processing_metrics, api_metrics]:
-                metrics["throughput"] = metrics["count"] / test_duration if test_duration > 0 else 0
-                metrics["received_kb_sec"] = metrics["total_response_kb"] / test_duration if test_duration > 0 else 0
-                metrics["sent_kb_sec"] = metrics["total_request_kb"] / test_duration if test_duration > 0 else 0
-
-            # Create a new Excel workbook with single sheet for all metrics
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Performance Metrics"
-            
-            # Header style
-            header_font = Font(bold=True, color="FFFFFF")
-            header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
-            
-            # Endpoint headers
-            endpoints = ["Token Endpoint", "ProcessID Endpoint", "API Endpoint"]
-            ws.append([""] + endpoints)
-            
-            # Apply header style
-            for cell in ws[1]:
-                cell.font = header_font
-                cell.fill = header_fill
-            
-            # Metrics to display (in order)
-            metric_rows = [
-                ("Total Requests", "count"),
-                ("Successful Requests", "success_count"),
-                ("Failed Requests", "error_count"),
-                ("Error Rate (%)", "error_rate", lambda x: f"{x:.2f}%"),
-                ("Average Latency (s)", "avg", lambda x: f"{x:.4f}"),
-                ("Minimum Latency (s)", "min", lambda x: f"{x:.4f}"),
-                ("Maximum Latency (s)", "max", lambda x: f"{x:.4f}"),
-                ("Median Latency (s)", "median", lambda x: f"{x:.4f}"),
-                ("90th Percentile (s)", "p90", lambda x: f"{x:.4f}"),
-                ("95th Percentile (s)", "p95", lambda x: f"{x:.4f}"),
-                ("99th Percentile (s)", "p99", lambda x: f"{x:.4f}"),
-                ("Throughput (requests/sec)", "throughput", lambda x: f"{x:.2f}"),
-                ("Total Sent (KB)", "total_request_kb", lambda x: f"{x:.2f}"),
-                ("Total Received (KB)", "total_response_kb", lambda x: f"{x:.2f}"),
-                ("Send Rate (KB/sec)", "sent_kb_sec", lambda x: f"{x:.2f}"),
-                ("Receive Rate (KB/sec)", "received_kb_sec", lambda x: f"{x:.2f}")
-            ]
-            
-            # Add all metrics
-            for label, metric_key, *formatter in metric_rows:
-                formatter = formatter[0] if formatter else lambda x: x
-                row = [label]
-                for metrics in [token_metrics, processing_metrics, api_metrics]:
-                    value = metrics.get(metric_key, 0)
-                    row.append(formatter(value))
-                ws.append(row)
-            
-            # Add summary section
-            ws.append([])  # Empty row
-            ws.append(["Test Summary"])
-            ws.append(["Test Duration (seconds)", f"{test_duration:.2f}"])
-            ws.append(["Total Threads", MAX_THREADS])
-            ws.append(["Total Tokens Generated", self.token_manager.total_tokens_generated])
-            ws.append(["Total Process IDs Generated", len(self.processing_stats)])
-            ws.append(["Total API Calls", len(self.api_stats)])
-            ws.append(["Total Successful Transactions", len([r for r in self.results if r["success"]])])
-            ws.append(["Total Failed Transactions", len([r for r in self.results if not r["success"]])])
-            ws.append(["Overall Error Rate", f"{((len(self.results) - len([r for r in self.results if r['success']])) / len(self.results) * 100 if len(self.results) > 0 else 0):.2f}%"])
-            ws.append(["Overall Throughput (requests/sec)", f"{len(self.results) / test_duration:.2f}" if test_duration > 0 else "0.00"])
-            
-            # Formatting
-            for col in ws.columns:
-                max_length = 0
-                column = col[0].column_letter
-                for cell in col:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-                adjusted_width = (max_length + 2)
-                ws.column_dimensions[column].width = adjusted_width
-            
-            # Add borders to metrics table
-            from openpyxl.styles import Border, Side
-            thin_border = Border(left=Side(style='thin'), 
-                                right=Side(style='thin'), 
-                                top=Side(style='thin'), 
-                                bottom=Side(style='thin'))
-            
-            for row in ws.iter_rows(min_row=1, max_row=len(metric_rows)+1, max_col=4):
-                for cell in row:
-                    cell.border = thin_border
-            
-            # Save the workbook
-            wb.save(OUTPUT_EXCEL)
-            print("✅ Comprehensive report generated successfully")
-            
-        except PermissionError:
-            print(f"❌ ERROR: Please close Excel file if open: {OUTPUT_EXCEL}")
-            raise
-        except Exception as e:
-            print(f"❌ Failed to generate report: {str(e)}")
-            raise
-
-    def run_dynamic_test(self):
-        print(f"🚀 Starting test with {MAX_THREADS} threads, each performing one flow...")
-        start_time = time.time()
-        self.completed_processes = 0  # Reset counter
-        
-        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-            # Submit exactly 50 workers, each performing one flow
-            futures = [executor.submit(self.worker) for _ in range(MAX_THREADS)]
-            
-            # Wait for all threads to complete
-            for future in as_completed(futures):
-                future.result()  # Ensure all futures are resolved
-        
-        test_duration = time.time() - start_time
-        self.generate_report(test_duration)
-        
-        print("\n=== TEST COMPLETE ===")
-        print(f"Total duration: {test_duration:.2f}s")
-        print(f"Total processes completed: {len(self.results)}")
-        print(f"Tokens generated: {self.token_manager.total_tokens_generated}")
-        print(f"Process IDs generated: {len(self.processing_stats)}")
-        print(f"API calls made: {len(self.api_stats)}")
-        print(f"Report saved to: {OUTPUT_EXCEL}")
-        
-        return self.results
+# Test data
+field_data = {
+    # Page 1 fields
+    "topmostSubform[0].Page1[0].f1_1[0]": "John Doe Smith",
+    "topmostSubform[0].Page1[0].f1_2[0]": "Individual",
+    "topmostSubform[0].Page1[0].f1_3[0]": "US Citizen",
+    "topmostSubform[0].Page1[0].f1_4[0]": "123 Main Street",
+    "topmostSubform[0].Page1[0].f1_5[0]": "New York",
+    "topmostSubform[0].Page1[0].f1_6[0]": "NY",
+    "topmostSubform[0].Page1[0].f1_7[0]": "10001",
+    "topmostSubform[0].Page1[0].f1_8[0]": "USA",
+    
+    # Page 2 fields
+    "topmostSubform[0].Page2[0].f2_1[0]": "United States",
+    "topmostSubform[0].Page2[0].Line9a_ReadOrder[0].f2_2[0]": "123-45-6789",
+    "topmostSubform[0].Page2[0].Line9b_ReadOrder[0].f2_3[0]": "987-65-4321",
+    "topmostSubform[0].Page2[0].f2_4[0]": "01/15/1985",
+    "topmostSubform[0].Page2[0].f2_5[0]": "New York",
+    "topmostSubform[0].Page2[0].f2_6[0]": "NY",
+    
+    # Page 3 fields
+    "topmostSubform[0].Page3[0].f3_1[0]": "Some Page 3 Data",
+    
+    # Page 8 fields
+    "topmostSubform[0].Page8[0].f8_1[0]": "Additional Info",
+    "topmostSubform[0].Page8[0].Table_Part29[0].BodyRow1[0].f8_3[0]": "Row 1 Col 1",
+    "topmostSubform[0].Page8[0].Table_Part29[0].BodyRow1[0].f8_4[0]": "Row 1 Col 2",
+}
 
 if __name__ == "__main__":
-    test = TestRunner()
-    results = test.run_dynamic_test()
+    input_pdf = "W8.pdf"
+    
+    # Test checkbox values first
+    print("=== TESTING CHECKBOX VALUES ===")
+    test_checkbox = "topmostSubform[0].Page1[0].c1_1[0]"
+    working_checkbox_value = test_checkbox_values_simple(input_pdf, test_checkbox)
+    
+    if working_checkbox_value:
+        print(f"\n✓ Found working checkbox value: {working_checkbox_value}")
+        
+        # Add checkboxes to the field data
+        field_data_with_checkboxes = field_data.copy()
+        field_data_with_checkboxes.update({
+            "topmostSubform[0].Page1[0].c1_1[0]": working_checkbox_value,
+            "topmostSubform[0].Page1[0].c1_1[1]": working_checkbox_value,
+            "topmostSubform[0].Page2[0].c2_1[0]": working_checkbox_value,
+            "topmostSubform[0].Page3[0].c3_1[0]": working_checkbox_value,
+        })
+        
+        print("\n=== FILLING FORM WITH CHECKBOXES ===")
+        success = fill_pdf_form_smart(input_pdf, "W8_filled_with_checkboxes.pdf", field_data_with_checkboxes)
+        if success:
+            verify_filled_pdf("W8_filled_with_checkboxes.pdf")
+    else:
+        print("\n✗ No working checkbox value found")
+        
+        print("\n=== FILLING FORM WITHOUT CHECKBOXES ===")
+        success = fill_pdf_form_smart(input_pdf, "W8_filled_regular.pdf", field_data)
+        if success:
+            verify_filled_pdf("W8_filled_regular.pdf")
