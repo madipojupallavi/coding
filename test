@@ -1,1179 +1,187 @@
-import os
-import logging
-import streamlit as st
-import bnym_eliza as eliza
-from bnym_eliza.utils import init_logger, get_jwt_from_certs
-import json
-import fitz  # PyMuPDF for PDF text extraction and writing
-import tempfile
-from typing import Dict, List, Any
-import pandas as pd
-
-# Initialize logger
-log = init_logger(__name__)
-
-# Constants
-BASE_FOLDER = r'C:\Users\A\Downloads'  # For cert/key files
-CERT_PATH = os.path.join(BASE_FOLDER, 'public 9.cer')
-PRIVATE_KEY_PATH = os.path.join(BASE_FOLDER, 'private 9.key')
-
-# Folder containing sample docs
-DOCS_FOLDER = r'C:\Users\A\Sync_Data\DocumentSamples'
-
-# Folder containing JSON schemas
-SCHEMA_FOLDER = os.path.join(os.path.dirname(__file__), 'schema')
-
-# Output folder for generated PDFs
-OUTPUT_FOLDER = r'C:\Users\A\Sync_Data\OutputPDFs'
-
-# Ensure output folder exists
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
-def query_eliza_chat(session, model: str, prompt: str) -> str:
-    """
-    Query Eliza ChatCompletion with given session, model, and prompt.
-    Returns the content string from the response.
-    """
-    try:
-        response = eliza.ChatCompletion.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        content = response["choices"][0]["message"]["content"]
-        return content
-    except Exception as e:
-        log.error(f"Error during eliza chat completion: {e}")
-        raise
-
-def get_jwt():
-    """
-    Generate JWT token using certificate and private key paths.
-    Raises an exception if generation fails.
-    """
-    try:
-        token = get_jwt_from_certs(CERT_PATH, PRIVATE_KEY_PATH)
-        log.info("JWT token successfully generated.")
-        return token
-    except Exception as e:
-        log.error(f"Failed to generate JWT token: {e}")
-        raise
-
-def load_schema(form_name: str) -> Dict[str, Any]:
-    """
-    Load JSON schema for a given form name.
-    """
-    try:
-        schema_path = os.path.join(SCHEMA_FOLDER, f"{form_name}.json")
-        with open(schema_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        log.error(f"Error loading schema for {form_name}: {e}")
-        raise
-
-def extract_pdf_fields(pdf_path: str) -> List[Dict[str, str]]:
-    """
-    Extract form fields from PDF using PyMuPDF.
-    Returns list of field information.
-    """
-    try:
-        doc = fitz.open(pdf_path)
-        fields = []
-        
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            widgets = page.widgets()
-            
-            for widget in widgets:
-                field_info = {
-                    'field_name': widget.field_name,
-                    'field_type': str(widget.field_type),
-                    'field_value': widget.field_value,
-                    'page_num': page_num,
-                    'rect': widget.rect
-                }
-                fields.append(field_info)
-        
-        doc.close()
-        return fields
-    
-    except Exception as e:
-        log.error(f"Error extracting PDF fields from {pdf_path}: {e}")
-        raise
-
-def generate_synthetic_data(jwt_token: str, model: str, schema: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Generate synthetic data based on schema using LLM.
-    """
-    try:
-        mandatory_fields = schema.get('mandatory_fields', {})
-        
-        # Create prompt for LLM
-        prompt = f"""
-        Generate synthetic data for a PDF form with the following mandatory fields:
-        {json.dumps(mandatory_fields, indent=2)}
-        
-        Please return a JSON object with field names as keys and appropriate synthetic values.
-        Ensure all values are realistic and properly formatted for the field types.
-        For dates, use YYYY-MM-DD format.
-        For boolean fields, use true/false.
-        For text fields, generate realistic sample data.
-        
-        Return only the JSON object, no additional text.
-        """
-        
-        response = query_eliza_chat(jwt_token, model, prompt)
-        
-        # Try to parse JSON response
-        try:
-            return json.loads(response)
-        except json.JSONDecodeError:
-            # If response is not valid JSON, try to extract JSON from response
-            import re
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-            else:
-                raise ValueError("Could not extract valid JSON from LLM response")
-                
-    except Exception as e:
-        log.error(f"Error generating synthetic data: {e}")
-        raise
-
-def fill_pdf_form(pdf_path: str, data: Dict[str, Any], output_path: str) -> bool:
-    """
-    Fill PDF form fields with generated data and save to output path.
-    """
-    try:
-        doc = fitz.open(pdf_path)
-        fields_filled = 0
-        
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            widgets = page.widgets()
-            
-            for widget in widgets:
-                field_name = widget.field_name
-                
-                if field_name in data:
-                    try:
-                        value = data[field_name]
-                        
-                        # Handle different field types
-                        if widget.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
-                            if isinstance(value, bool):
-                                widget.field_value = value
-                            elif isinstance(value, str):
-                                widget.field_value = value.lower() in ['true', '1', 'yes', 'on']
-                        
-                        elif widget.field_type == fitz.PDF_WIDGET_TYPE_RADIOBUTTON:
-                            widget.field_value = str(value)
-                        
-                        else:  # Text fields and others
-                            widget.field_value = str(value)
-                        
-                        widget.update()
-                        fields_filled += 1
-                        
-                    except Exception as field_error:
-                        log.warning(f"Error filling field {field_name}: {field_error}")
-        
-        # Save the filled PDF
-        doc.save(output_path)
-        doc.close()
-        
-        log.info(f"Successfully filled {fields_filled} fields in PDF: {output_path}")
-        return True
-        
-    except Exception as e:
-        log.error(f"Error filling PDF form: {e}")
-        return False
-
-def create_preview_data(data: Dict[str, Any]) -> pd.DataFrame:
-    """
-    Create a DataFrame for preview display.
-    """
-    preview_data = []
-    for field_name, value in data.items():
-        preview_data.append({
-            'Field Name': field_name,
-            'Generated Value': str(value),
-            'Data Type': type(value).__name__
-        })
-    
-    return pd.DataFrame(preview_data)
-
-def main():
-    """
-    Main Streamlit application.
-    """
-    st.set_page_config(
-        page_title="PDF Sync Data Generator",
-        page_icon="📄",
-        layout="wide"
-    )
-    
-    st.title("📄 PDF Sync Data Generator")
-    st.markdown("Generate synthetic data for PDF forms using AI and fill them automatically")
-    
-    # Sidebar for configuration
-    st.sidebar.header("Configuration")
-    
-    # Form selection
-    form_options = ["w8", "w9", "onboarding", "ccmddq", "cbddq", "onboardingcorporate"]
-    selected_forms = st.sidebar.multiselect(
-        "Select PDF Forms to Generate",
-        form_options,
-        help="Choose one or more PDF forms to generate data for"
-    )
-    
-    # LLM model selection
-    llm_models = [
-        "gpt-4", 
-        "gpt-3.5-turbo", 
-        "eliza-advanced", 
-        "eliza-base"
-    ]
-    selected_model = st.sidebar.selectbox(
-        "Select LLM Model",
-        llm_models,
-        help="Choose the AI model for data generation"
-    )
-    
-    # Number of responses
-    num_responses = st.sidebar.slider(
-        "Number of Responses per Form",
-        min_value=1,
-        max_value=20,
-        value=3,
-        help="How many filled PDFs to generate for each form"
-    )
-    
-    if not selected_forms:
-        st.info("👆 Please select at least one PDF form from the sidebar to get started.")
-        return
-    
-    # Main content area
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.subheader(f"Selected Forms: {', '.join(selected_forms)}")
-        st.write(f"**Model:** {selected_model}")
-        st.write(f"**Responses per form:** {num_responses}")
-        
-        # Preview and Generate buttons
-        preview_btn = st.button("🔍 Preview Generated Data", type="secondary")
-        generate_btn = st.button("🚀 Generate and Fill PDFs", type="primary")
-        
-    with col2:
-        st.subheader("Process Status")
-        status_placeholder = st.empty()
-        progress_placeholder = st.empty()
-    
-    # Preview functionality
-    if preview_btn:
-        try:
-            status_placeholder.info("🔄 Generating preview data...")
-            jwt_token = get_jwt()
-            
-            preview_data = {}
-            
-            for form_name in selected_forms:
-                with st.expander(f"📋 Preview for {form_name.upper()}", expanded=True):
-                    try:
-                        # Load schema
-                        schema = load_schema(form_name)
-                        
-                        # Generate one sample
-                        sample_data = generate_synthetic_data(jwt_token, selected_model, schema)
-                        preview_data[form_name] = sample_data
-                        
-                        # Create preview DataFrame
-                        df = create_preview_data(sample_data)
-                        st.dataframe(df, use_container_width=True)
-                        
-                        # Show schema info
-                        st.write(f"**Mandatory fields:** {len(schema.get('mandatory_fields', {}))}")
-                        
-                    except Exception as e:
-                        st.error(f"Error generating preview for {form_name}: {str(e)}")
-            
-            status_placeholder.success("✅ Preview generated successfully!")
-            
-        except Exception as e:
-            status_placeholder.error(f"❌ Error generating preview: {str(e)}")
-    
-    # Generate and fill functionality
-    if generate_btn:
-        try:
-            status_placeholder.info("🔄 Initializing generation process...")
-            jwt_token = get_jwt()
-            
-            total_operations = len(selected_forms) * num_responses
-            current_operation = 0
-            
-            progress_bar = progress_placeholder.progress(0)
-            
-            generated_files = []
-            
-            for form_name in selected_forms:
-                st.write(f"### Processing {form_name.upper()}")
-                
-                try:
-                    # Load schema
-                    schema = load_schema(form_name)
-                    pdf_path = os.path.join(DOCS_FOLDER, f"{form_name}.pdf")
-                    
-                    if not os.path.exists(pdf_path):
-                        st.error(f"PDF template not found: {pdf_path}")
-                        continue
-                    
-                    # Generate multiple responses
-                    for i in range(num_responses):
-                        current_operation += 1
-                        progress = current_operation / total_operations
-                        progress_bar.progress(progress)
-                        
-                        status_placeholder.info(f"🔄 Generating {form_name} #{i+1}...")
-                        
-                        # Generate synthetic data
-                        synthetic_data = generate_synthetic_data(jwt_token, selected_model, schema)
-                        
-                        # Create output filename
-                        output_filename = f"{form_name}_filled_{i+1}.pdf"
-                        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
-                        
-                        # Fill PDF form
-                        if fill_pdf_form(pdf_path, synthetic_data, output_path):
-                            generated_files.append({
-                                'form': form_name,
-                                'file': output_filename,
-                                'path': output_path
-                            })
-                            st.success(f"✅ Generated: {output_filename}")
-                        else:
-                            st.error(f"❌ Failed to generate: {output_filename}")
-                
-                except Exception as e:
-                    st.error(f"Error processing {form_name}: {str(e)}")
-            
-            # Summary
-            status_placeholder.success(f"✅ Generation complete! Created {len(generated_files)} files.")
-            progress_bar.progress(1.0)
-            
-            # Download section
-            if generated_files:
-                st.subheader("📥 Download Generated Files")
-                
-                for file_info in generated_files:
-                    col_download, col_info = st.columns([1, 3])
-                    
-                    with col_download:
-                        try:
-                            with open(file_info['path'], 'rb') as file:
-                                st.download_button(
-                                    label=f"⬇️ {file_info['file']}",
-                                    data=file.read(),
-                                    file_name=file_info['file'],
-                                    mime="application/pdf"
-                                )
-                        except Exception as e:
-                            st.error(f"Error creating download button: {e}")
-                    
-                    with col_info:
-                        st.write(f"**Form:** {file_info['form'].upper()}")
-                        st.write(f"**Path:** `{file_info['path']}`")
-        
-        except Exception as e:
-            status_placeholder.error(f"❌ Error during generation: {str(e)}")
-            log.error(f"Generation error: {e}")
-
-if __name__ == "__main__":
-    main()
-
-
-# Schema Files for PDF Forms
-
-You'll need to create JSON schema files in the `schema/` folder for each form type. Here are example schema files:
-
-## w8.json
-```json
-{
-    "form_name": "W8",
-    "form_type": "tax_form",
-    "mandatory_fields": {
-        "name": {
-            "type": "text",
-            "description": "Full legal name",
-            "required": true
-        },
-        "country_of_citizenship": {
-            "type": "text", 
-            "description": "Country of tax residence",
-            "required": true
-        },
-        "permanent_address": {
-            "type": "text",
-            "description": "Permanent address",
-            "required": true
-        },
-        "us_tin": {
-            "type": "text",
-            "description": "U.S. taxpayer identification number",
-            "required": false
-        },
-        "foreign_tin": {
-            "type": "text", 
-            "description": "Foreign tax identifying number",
-            "required": true
-        },
-        "signature": {
-            "type": "text",
-            "description": "Digital signature",
-            "required": true
-        },
-        "date_signed": {
-            "type": "date",
-            "description": "Date of signature",
-            "required": true
-        }
-    }
-}
-```
-
-## w9.json
-```json
-{
-    "form_name": "W9", 
-    "form_type": "tax_form",
-    "mandatory_fields": {
-        "name": {
-            "type": "text",
-            "description": "Name as shown on your income tax return",
-            "required": true
-        },
-        "business_name": {
-            "type": "text",
-            "description": "Business name/disregarded entity name",
-            "required": false
-        },
-        "tax_classification": {
-            "type": "select",
-            "description": "Federal tax classification",
-            "options": ["Individual", "Corporation", "Partnership", "LLC"],
-            "required": true
-        },
-        "address": {
-            "type": "text", 
-            "description": "Address (number, street, apt/suite no.)",
-            "required": true
-        },
-        "city_state_zip": {
-            "type": "text",
-            "description": "City, state, and ZIP code", 
-            "required": true
-        },
-        "ssn_ein": {
-            "type": "text",
-            "description": "Social Security Number or Employer Identification Number",
-            "required": true
-        },
-        "signature": {
-            "type": "text",
-            "description": "Signature",
-            "required": true
-        },
-        "date": {
-            "type": "date",
-            "description": "Date",
-            "required": true
-        }
-    }
-}
-```
-
-## onboarding.json
-```json
-{
-    "form_name": "Client Onboarding",
-    "form_type": "client_form", 
-    "mandatory_fields": {
-        "client_name": {
-            "type": "text",
-            "description": "Full client name",
-            "required": true
-        },
-        "company_name": {
-            "type": "text",
-            "description": "Company/Organization name", 
-            "required": true
-        },
-        "email": {
-            "type": "email",
-            "description": "Primary email address",
-            "required": true
-        },
-        "phone": {
-            "type": "text",
-            "description": "Phone number",
-            "required": true
-        },
-        "business_type": {
-            "type": "select",
-            "description": "Type of business",
-            "options": ["Corporation", "LLC", "Partnership", "Sole Proprietorship", "Non-Profit"],
-            "required": true
-        },
-        "account_type": {
-            "type": "select", 
-            "description": "Account type requested",
-            "options": ["Basic", "Premium", "Enterprise"],
-            "required": true
-        },
-        "compliance_officer": {
-            "type": "text",
-            "description": "Assigned compliance officer",
-            "required": false
-        }
-    }
-}
-```
-
-## ccmddq.json (Customer Due Diligence)
-```json
-{
-    "form_name": "CCMDDQ",
-    "form_type": "due_diligence",
-    "mandatory_fields": {
-        "entity_name": {
-            "type": "text", 
-            "description": "Legal entity name",
-            "required": true
-        },
-        "jurisdiction": {
-            "type": "text",
-            "description": "Jurisdiction of incorporation",
-            "required": true
-        },
-        "entity_type": {
-            "type": "select",
-            "description": "Entity type",
-            "options": ["Corporation", "Limited Partnership", "Fund", "Trust"],
-            "required": true
-        },
-        "regulatory_status": {
-            "type": "text",
-            "description": "Regulatory status/classification",
-            "required": true
-        },
-        "aum": {
-            "type": "number",
-            "description": "Assets under management (USD millions)",
-            "required": true
-        },
-        "primary_contact": {
-            "type": "text",
-            "description": "Primary contact person",
-            "required": true
-        },
-        "contact_email": {
-            "type": "email", 
-            "description": "Contact email",
-            "required": true
-        }
-    }
-}
-```
-
-## cbddq.json (Counterparty Due Diligence)
-```json
-{
-    "form_name": "CBDDQ",
-    "form_type": "due_diligence",
-    "mandatory_fields": {
-        "counterparty_name": {
-            "type": "text",
-            "description": "Legal name of counterparty",
-            "required": true
-        },
-        "lei_code": {
-            "type": "text",
-            "description": "Legal Entity Identifier",
-            "required": true
-        },
-        "credit_rating": {
-            "type": "select", 
-            "description": "Credit rating",
-            "options": ["AAA", "AA", "A", "BBB", "BB", "B", "CCC", "Unrated"],
-            "required": true
-        },
-        "country_risk": {
-            "type": "text",
-            "description": "Country of primary operations",
-            "required": true
-        },
-        "business_relationship": {
-            "type": "text",
-            "description": "Nature of business relationship",
-            "required": true
-        },
-        "transaction_volume": {
-            "type": "number", 
-            "description": "Expected annual transaction volume (USD millions)",
-            "required": true
-        },
-        "risk_assessment": {
-            "type": "select",
-            "description": "Overall risk assessment",
-            "options": ["Low", "Medium", "High"],
-            "required": true
-        }
-    }
-}
-```
-
-## onboardingcorporate.json
-```json
-{
-    "form_name": "Corporate Onboarding",
-    "form_type": "corporate_client",
-    "mandatory_fields": {
-        "corporate_name": {
-            "type": "text",
-            "description": "Legal corporate name",
-            "required": true
-        },
-        "incorporation_date": {
-            "type": "date",
-            "description": "Date of incorporation",
-            "required": true
-        },
-        "registered_address": {
-            "type": "text",
-            "description": "Registered business address", 
-            "required": true
-        },
-        "business_purpose": {
-            "type": "text",
-            "description": "Primary business purpose/activities",
-            "required": true
-        },
-        "authorized_signatory": {
-            "type": "text",
-            "description": "Authorized signatory name",
-            "required": true
-        },
-        "signatory_title": {
-            "type": "text", 
-            "description": "Title of authorized signatory",
-            "required": true
-        },
-        "annual_revenue": {
-            "type": "number",
-            "description": "Annual revenue (USD millions)",
-            "required": true
-        },
-        "employee_count": {
-            "type": "number",
-            "description": "Number of employees",
-            "required": true
-        },
-        "banking_relationship": {
-            "type": "select",
-            "description": "Type of banking relationship desired",
-            "options": ["Cash Management", "Credit Facilities", "Investment Services", "Comprehensive"],
-            "required": true
-        }
-    }
-}
-```
-
-## Directory Structure
-```
-your-project/
-├── pdf-sync-data-generator.py
-├── schema/
-│   ├── w8.json
-│   ├── w9.json  
-│   ├── onboarding.json
-│   ├── ccmddq.json
-│   ├── cbddq.json
-│   └── onboardingcorporate.json
-├── C:/Users/A/Sync_Data/
-│   ├── DocumentSamples/
-│   │   ├── w8.pdf
-│   │   ├── w9.pdf
-│   │   ├── onboarding.pdf
-│   │   ├── ccmddq.pdf  
-│   │   ├── cbddq.pdf
-│   │   └── onboardingcorporate.pdf
-│   └── OutputPDFs/
-│       └── (generated files will be saved here)
-```
-
-
-You are an expert in Quality Assurance, tasked with generating detailed and exhaustive test
-cases for the provided user story information exported from Jira. The input will be an Excel
-sheet containing details of a single Jira story, including fields such as Summary,
-Description, Acceptance Criteria, and any Dependencies.
-
-Your objective is to ensure that the test cases are comprehensive, covering all relevant
-functional scenarios, while being clear and concise. Ensure dependencies between user
-stories are considered when applicable.
-
-Input (from Jira export in Excel):  
-{jira_excel_data}
-
-Task:
-Generate functional test cases that thoroughly cover the entire functionality described in
-the Jira story. Ensure both positive and negative test cases are provided for a comprehensive
-assessment of all possible scenarios. The generated test cases should align with the
-acceptance criteria of the story and consider any dependencies.
-
-Instructions for Test Case Generation:
-1. Extract User Story Context:
-   - Use the Summary and Description from the Excel sheet to understand the story.
-   - Use Acceptance Criteria as the guiding rules for validation.
-   - Consider Dependencies if they are listed.
-2. Break Down Story:
-   - Split the story into logical steps and generate test cases for each step, ensuring maximum coverage of all scenarios.
-   - Include both positive and negative test cases to assess functionality, error handling, and edge cases.
-3. Prerequisites Requirement:
-   - For EACH test case, explicitly define the PREREQUISITES that must be met before executing the test.
-   - Prerequisites should include:
-     a) System configurations required
-     b) Preconditions or states that must exist
-     c) Data setup or user account preparations
-     d) Any dependencies or prior actions needed
-4. Ensure the Output Test Cases format is strictly valid JSON. Do not include comments, markdown, or any text outside the JSON structure and also don't include placeholders. Do not generate ambiguous test cases - all test steps, test data, and expected results must be specific and unambiguous. The structure must follow BDD (Given–When–Then) style for scenarios:
-
-[
-  {
-    "testCaseId": "Unique Test Case ID",
-    "userStory": "User story (derived from Summary/Description)",
-    "testCase": "Short description of the test case",
-    "prerequisites": "Detailed list of all prerequisites required to execute this test case in numbered bullets format",
-    "bddScenario": {
-        "given": [
-            "List of preconditions or initial state"
-        ],
-        "when": [
-            "List of actions or steps performed"
-        ],
-        "then": [
-            "List of expected outcomes and validations"
-        ]
-    },
-    "testSteps": [
-      {
-        "stepNumber": 1,
-        "stepDescription": "Detailed description of the test step",
-        "testData": "Specific test data to be used for this step (e.g., input values, file names, URLs, etc.)",
-        "expectedResult": "Expected outcome or behavior for this specific step"
-      },
-      {
-        "stepNumber": 2,
-        "stepDescription": "Detailed description of the test step",
-        "testData": "Specific test data to be used for this step",
-        "expectedResult": "Expected outcome or behavior for this specific step"
-      }
-    ]
-  },
-  ...
-]
-
-5. It doesn't mean to generate only one positive and one negative test case, generate as many as possible for that user story but maintain the format.
-6. Based on features and variables in the user story, generate separate test cases for every permutation.
-
-Sample Positive Test Case (BDD JSON):
-
-{
-  "testCaseId": "TC_POS_01",
-  "userStory": "As a user, I want to log in to the application so that I can access my account features.",
-  "testCase": "Verify successful login for valid credentials.",
-  "prerequisites": "1. User account exists in the system\\n2. Network connection is stable\\n3. Login page is accessible",
-  "bddScenario": {
-    "given": [
-      "The user is on the login page",
-      "A valid user account exists in the system"
-    ],
-    "when": [
-      "The user enters a valid username",
-      "The user enters a valid password",
-      "The user clicks the 'Login' button"
-    ],
-    "then": [
-      "The system accepts the username and password without validation errors",
-      "The user is redirected to the homepage",
-      "A welcome message is displayed"
-    ]
-  },
-  "testSteps": [
-    {
-      "stepNumber": 1,
-      "stepDescription": "Navigate to the login page",
-      "testData": "URL: https://app.example.com/login",
-      "expectedResult": "Login page loads successfully with username and password fields visible"
-    },
-    {
-      "stepNumber": 2,
-      "stepDescription": "Enter valid username in the username field",
-      "testData": "Username: testuser@example.com",
-      "expectedResult": "Username is entered without any validation errors"
-    },
-    {
-      "stepNumber": 3,
-      "stepDescription": "Enter valid password in the password field",
-      "testData": "Password: ValidPass123!",
-      "expectedResult": "Password is entered and masked with asterisks or dots"
-    },
-    {
-      "stepNumber": 4,
-      "stepDescription": "Click the Login button",
-      "testData": "N/A",
-      "expectedResult": "Login button is clickable and triggers authentication process"
-    },
-    {
-      "stepNumber": 5,
-      "stepDescription": "Verify successful login and redirection",
-      "testData": "N/A",
-      "expectedResult": "User is redirected to homepage with welcome message displaying username"
-    }
-  ]
+field_labels = {
+    "1": "Full Legal Name",
+    "2": "Foreign branches",
+    "3": "Registered Address", 
+    "4": "Business Address",
+    "5": "Incorporation Date",
+    "ComboBox1": "Publicly traded (Q6a)",
+    "6 a1": "Exchange and ticker",
+    "ComboBox2": "Member owned (Q6b)",
+    "ComboBox3": "Government owned (Q6c)",
+    "ComboBox4": "Privately owned (Q6d)",
+    "6 d1": "Private ownership details",
+    "7": "Bearer shares percentage (Q7)",
+    "ComboBox5": "Offshore banking license (Q8)",
+    "9": "Primary regulator",
+    "10": "LEI Code",
+    "11": "Ultimate parent",
+    "12": "Parent jurisdiction",
+    "ComboBox6": "Retail banking",
+    "ComboBox7": "Private banking",
+    "ComboBox8": "Commercial banking",
+    "ComboBox9": "Transactional banking",
+    "ComboBox10": "Investment banking",
+    "ComboBox11": "Financial markets",
+    "ComboBox12": "Securities services",
+    "ComboBox13": "Broker dealer",
+    "ComboBox14": "Multilateral dev bank",
+    "13j": "Other business",
+    "ComboBox15": "Non-resident customers (Q14)",
+    "14a": "Countries",
+    "ComboBox16": "Number of employees",
+    "ComboBox17": "Total assets",
+    "ComboBox18": "Responses representative (Q16)",
+    "ComboBox19": "Trade finance",
+    "ComboBox20": "Foreign exchange",
+    "ComboBox21": "Money transfer services",
+    "ComboBox22": "Clearing services",
+    "ComboBox23": "Settlement services",
+    "ComboBox44": "Written AML policies",
+    "ComboBox45": "Board approved AML program",
+    "ComboBox46": "AML officer designation",
+    "ComboBox47": "Independent AML audit",
+    "ComboBox48": "AML training program",
+    "ComboBox72": "CDD procedures",
+    "ComboBox73": "Enhanced due diligence",
+    "ComboBox74": "Ongoing monitoring",
+    "ComboBox75": "Beneficial ownership identification",
+    "ComboBox90": "Transaction monitoring system",
+    "ComboBox91": "Suspicious activity reporting",
+    "ComboBox92": "Currency transaction reporting",
+    "ComboBox93": "Sanctions screening",
+    "ComboBox94": "Wire transfer procedures",
+    "ComboBox95": "Record retention policies",
+    "ComboBox96": "Customer records maintained",
+    "ComboBox97": "Transaction records maintained",
+    "16a": "Employee count details",
+    "16b": "Asset size details",
+    "17p": "Institution type",
+    "18": "Representative confirmation",
+    "18b": "Representative details",
+    "23 a": "Regulatory framework",
+    "24": "Compliance areas",
+    "24b": "Reporting requirements",
+    "39 a": "Geographic regions",
+    "39 b": "Country presence",
+    "46 a": "Office locations",
+    "46 b": "Office types",
+    "49 a": "Certifications",
+    "52 a": "Auditor type",
+    "53 a": "Audit frequency",
+    "53 b": "Internal audit schedule",
+    "57 d": "Monitoring approach",
+    "60F": "Transaction monitoring systems",
+    "70 V": "Real-time screening",
+    "71": "Risk scoring capabilities",
+    "73 a": "Monitoring coverage",
+    "73 b": "Detection systems",
+    "76": "Case management tools",
+    "79 a": "Security architecture",
+    "79 b": "Encryption and communications",
+    "81 b1": "SWIFT compliance",
+    "81 c": "Cross-border payment screening",
+    "85 a": "Customer risk profiling",
+    "85 b": "Risk assessment capabilities",
+    "93f": "Sanctions and PEP screening",
+    "97 a": "Audit trail maintenance",
+    "97 b": "Regulatory reporting systems",
+    "102a": "Defense model",
+    "102b": "Risk management function",
+    "105 a": "Staff training",
+    "105 b": "Professional development",
+    "108 i": "Incident response planning",
+    "110 a": "Security testing",
+    "110 b": "Continuous monitoring",
+    "dp1": "Institution name",
+    "dp2": "Correspondent Banking Head",
+    "dp3": "MLRO",
+    "dp4": "Date",
+    "dp5": "Location",
+    "Textfield": "Correspondent Banking Head details",
+    "Textfield-0": "MLRO details"
 }
 
-Sample Negative Test Case (BDD JSON):
+# W-9 PDF Field Names to Labels Dictionary
+# Based on your actual PDF field structure
 
-{
-  "testCaseId": "TC_NEG_01",
-  "userStory": "As a user, I want to log in to the application so that I can access my account features.",
-  "testCase": "Verify error message when login fails due to invalid password.",
-  "prerequisites": "1. User account exists in the system\\n2. Network connection is stable\\n3. Login page is accessible",
-  "bddScenario": {
-    "given": [
-      "The user is on the login page",
-      "A valid user account exists in the system"
-    ],
-    "when": [
-      "The user enters a valid username",
-      "The user enters an invalid password",
-      "The user clicks the 'Login' button"
-    ],
-    "then": [
-      "The system detects the invalid password",
-      "An error message is displayed: 'Invalid username or password'"
-    ]
-  },
-  "testSteps": [
-    {
-      "stepNumber": 1,
-      "stepDescription": "Navigate to the login page",
-      "testData": "URL: https://app.example.com/login",
-      "expectedResult": "Login page loads successfully with username and password fields visible"
-    },
-    {
-      "stepNumber": 2,
-      "stepDescription": "Enter valid username in the username field",
-      "testData": "Username: testuser@example.com",
-      "expectedResult": "Username is entered without any validation errors"
-    },
-    {
-      "stepNumber": 3,
-      "stepDescription": "Enter invalid password in the password field",
-      "testData": "Password: WrongPassword123",
-      "expectedResult": "Invalid password is entered and masked with asterisks or dots"
-    },
-    {
-      "stepNumber": 4,
-      "stepDescription": "Click the Login button",
-      "testData": "N/A",
-      "expectedResult": "Login button is clickable and triggers authentication process"
-    },
-    {
-      "stepNumber": 5,
-      "stepDescription": "Verify error message display",
-      "testData": "N/A",
-      "expectedResult": "Error message 'Invalid username or password' is displayed in red text below login form"
-    }
-  ]
+w9_field_labels = {
+    # Basic Information Fields
+    "topmostSubform[0].Page1[0].f1_01[0]": "Name (as shown on your income tax return)",
+    "topmostSubform[0].Page1[0].f1_02[0]": "Business name/disregarded entity name (if different from above)",
+    
+    # Tax Classification Section (Line 3)
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].c1_1[0]": "Individual/sole proprietor or single-member LLC",
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].c1_1[1]": "C Corporation",
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].c1_1[2]": "S Corporation", 
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].c1_1[3]": "Partnership",
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].c1_1[4]": "Trust/estate",
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].c1_1[5]": "Limited liability company (LLC)",
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].c1_1[6]": "Other",
+    
+    # LLC Tax Classification and Other Field
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].f1_03[0]": "LLC tax classification (C=C corp, S=S corp, P=Partnership)",
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].f1_04[0]": "Other tax classification (see instructions)",
+    
+    # Line 3b - Foreign Classification
+    "topmostSubform[0].Page1[0].Boxes3a-b_ReadOrder[0].c1_2[0]": "Exempt payee code (if any)",
+    
+    # Exemptions (Line 4)
+    "topmostSubform[0].Page1[0].f1_05[0]": "Exempt payee code (if any)",
+    "topmostSubform[0].Page1[0].f1_06[0]": "Exemption from FATCA reporting code (if any)",
+    
+    # Address Information (Line 5-7)
+    "topmostSubform[0].Page1[0].Address_ReadOrder[0].f1_07[0]": "Address (number, street, and apt. or suite no.)",
+    "topmostSubform[0].Page1[0].Address_ReadOrder[0].f1_08[0]": "City, state, and ZIP code",
+    
+    # Additional Information
+    "topmostSubform[0].Page1[0].f1_09[0]": "List account number(s) here (optional)",
+    "topmostSubform[0].Page1[0].f1_10[0]": "Requester's name and address (optional)",
+    
+    # Part I: Taxpayer Identification Number (TIN)
+    # Social Security Number (SSN)
+    "topmostSubform[0].Page1[0].f1_11[0]": "Social Security Number - First 3 digits",
+    "topmostSubform[0].Page1[0].f1_12[0]": "Social Security Number - Middle 2 digits", 
+    "topmostSubform[0].Page1[0].f1_13[0]": "Social Security Number - Last 4 digits",
+    
+    # Employer Identification Number (EIN)
+    "topmostSubform[0].Page1[0].f1_14[0]": "Employer Identification Number - First 2 digits",
+    "topmostSubform[0].Page1[0].f1_15[0]": "Employer Identification Number - Last 7 digits",
 }
 
-Additional Instructions:
-1. For each test case:
-   - Ensure the BDD Scenarios (Given, When, Then) are clearly broken down and exhaustive.
-   - Include all possible validation, error-handling, and edge-case scenarios.
-   - Ensure scenarios align with the acceptance criteria and interdependencies.
-2. Provide test cases that include:
-   - Validations for common functionalities like adding, editing, managing, and deleting data.
-   - Multi-step processes, especially those requiring confirmations or transactions.
-   - Error handling, validation messages, and workflows involving conflicting or missing data.
-3. Ensure the test cases are exhaustive and detailed, covering maximum functional scenarios, but are presented in a clear and concise format.
-4. We need test cases for every user story after breaking that into logical steps.
-
-You are an expert in Quality Assurance, tasked with generating detailed and exhaustive test
-cases for the provided user story information exported from Jira. The input will be an Excel
-sheet containing details of a single Jira story, including fields such as Summary,
-Description, Acceptance Criteria, and any Dependencies.
-
-Your objective is to ensure that the test cases are comprehensive, covering all relevant
-functional scenarios, while being clear and concise. Ensure dependencies between user
-stories are considered when applicable.
-
-Input (from Jira export in Excel):  
-{jira_excel_data}
-
-Task:
-Generate functional test cases that thoroughly cover the entire functionality described in
-the Jira story. Ensure both positive and negative test cases are provided for a comprehensive
-assessment of all possible scenarios. The generated test cases should align with the
-acceptance criteria of the story and consider any dependencies.
-
-Instructions for Test Case Generation:
-1. Extract User Story Context:
-   - Use the Summary and Description from the Excel sheet to understand the story.
-   - Use Acceptance Criteria as the guiding rules for validation.
-   - Consider Dependencies if they are listed.
-2. Break Down Story:
-   - Split the story into logical steps and generate test cases for each step, ensuring maximum coverage of all scenarios.
-   - Include both positive and negative test cases to assess functionality, error handling, and edge cases.
-3. Prerequisites Requirement:
-   - For EACH test case, explicitly define the PREREQUISITES that must be met before executing the test.
-   - Prerequisites should include:
-     a) System configurations required
-     b) Preconditions or states that must exist
-     c) Data setup or user account preparations
-     d) Any dependencies or prior actions needed
-4. Ensure the Output Test Cases format is strictly valid JSON. Do not include comments, markdown, or any text outside the JSON structure and also don't include placeholders. Do not generate ambiguous test cases - all test steps, test data, and expected results must be specific and unambiguous. The structure must follow BDD (Given–When–Then) style for scenarios:
-
-[
-  {
-    "testCaseId": "Unique Test Case ID",
-    "userStory": "User story (derived from Summary/Description)",
-    "testCase": "Short description of the test case",
-    "prerequisites": "Detailed list of all prerequisites required to execute this test case in numbered bullets format",
-    "bddScenario": {
-        "given": [
-            "List of preconditions or initial state"
-        ],
-        "when": [
-            "List of actions or steps performed"
-        ],
-        "then": [
-            "List of expected outcomes and validations"
-        ]
-    },
-    "testSteps": [
-      {
-        "stepNumber": 1,
-        "gherkinStep": "Gherkin step using Given/When/Then/And/But keywords",
-        "testData": "Specific test data to be used for this step (e.g., exact input values, credentials, file names, URLs, etc.) - avoid generic terms like 'laptop', 'equipment'; use actual data values like 'Username: john.doe@example.com, Password: Test123!'",
-        "expectedResult": "Expected outcome or behavior for this specific step"
-      },
-      {
-        "stepNumber": 2,
-        "gherkinStep": "Gherkin step using Given/When/Then/And/But keywords",
-        "testData": "Specific test data to be used for this step",
-        "expectedResult": "Expected outcome or behavior for this specific step"
-      }
-    ]
-  },
-  ...
-]
-
-5. It doesn't mean to generate only one positive and one negative test case, generate as many as possible for that user story but maintain the format.
-6. Based on features and variables in the user story, generate separate test cases for every permutation.
-
-Sample Positive Test Case (BDD JSON):
-
-{
-  "testCaseId": "TC_POS_01",
-  "userStory": "As a user, I want to log in to the application so that I can access my account features.",
-  "testCase": "Verify successful login for valid credentials.",
-  "prerequisites": "1. User account exists in the system\\n2. Network connection is stable\\n3. Login page is accessible",
-  "bddScenario": {
-    "given": [
-      "The user is on the login page",
-      "A valid user account exists in the system"
-    ],
-    "when": [
-      "The user enters a valid username",
-      "The user enters a valid password",
-      "The user clicks the 'Login' button"
-    ],
-    "then": [
-      "The system accepts the username and password without validation errors",
-      "The user is redirected to the homepage",
-      "A welcome message is displayed"
-    ]
-  },
-  "testSteps": [
-    {
-      "stepNumber": 1,
-      "gherkinStep": "Given I am on the login page",
-      "testData": "URL: https://app.example.com/login",
-      "expectedResult": "Login page loads successfully with username and password fields visible"
-    },
-    {
-      "stepNumber": 2,
-      "gherkinStep": "When I enter valid username in the username field",
-      "testData": "Username: testuser@example.com",
-      "expectedResult": "Username is entered without any validation errors"
-    },
-    {
-      "stepNumber": 3,
-      "gherkinStep": "And I enter valid password in the password field",
-      "testData": "Password: ValidPass123!",
-      "expectedResult": "Password is entered and masked with asterisks or dots"
-    },
-    {
-      "stepNumber": 4,
-      "gherkinStep": "And I click the Login button",
-      "testData": "N/A",
-      "expectedResult": "Login button is clickable and triggers authentication process"
-    },
-    {
-      "stepNumber": 5,
-      "gherkinStep": "Then I should be redirected to homepage with welcome message",
-      "testData": "N/A",
-      "expectedResult": "User is redirected to homepage with welcome message displaying username"
-    }
-  ]
+# Alternative simplified mapping (shorter field names for easier reference)
+w9_simple_field_labels = {
+    # Basic Info
+    "f1_01[0]": "Name",
+    "f1_02[0]": "Business name/DBA",
+    
+    # Tax Classification Checkboxes
+    "c1_1[0]": "☐ Individual/sole proprietor",
+    "c1_1[1]": "☐ C Corporation", 
+    "c1_1[2]": "☐ S Corporation",
+    "c1_1[3]": "☐ Partnership",
+    "c1_1[4]": "☐ Trust/estate",
+    "c1_1[5]": "☐ Limited liability company (LLC)",
+    "c1_1[6]": "☐ Other",
+    
+    # Additional Fields
+    "f1_03[0]": "LLC tax classification",
+    "f1_04[0]": "Other classification description",
+    "c1_2[0]": "☐ Line 3b checkbox",
+    "f1_05[0]": "Exempt payee code",
+    "f1_06[0]": "FATCA exemption code", 
+    
+    # Address
+    "f1_07[0]": "Street address",
+    "f1_08[0]": "City, state, ZIP",
+    "f1_09[0]": "Account numbers",
+    "f1_10[0]": "Requester info",
+    
+    # TIN - SSN
+    "f1_11[0]": "SSN (###)",
+    "f1_12[0]": "SSN (##)",
+    "f1_13[0]": "SSN (####)",
+    
+    # TIN - EIN  
+    "f1_14[0]": "EIN (##)",
+    "f1_15[0]": "EIN (#######)",
 }
-
-Sample Negative Test Case (BDD JSON):
-
-{
-  "testCaseId": "TC_NEG_01",
-  "userStory": "As a user, I want to log in to the application so that I can access my account features.",
-  "testCase": "Verify error message when login fails due to invalid password.",
-  "prerequisites": "1. User account exists in the system\\n2. Network connection is stable\\n3. Login page is accessible",
-  "bddScenario": {
-    "given": [
-      "The user is on the login page",
-      "A valid user account exists in the system"
-    ],
-    "when": [
-      "The user enters a valid username",
-      "The user enters an invalid password",
-      "The user clicks the 'Login' button"
-    ],
-    "then": [
-      "The system detects the invalid password",
-      "An error message is displayed: 'Invalid username or password'"
-    ]
-  },
-  "testSteps": [
-    {
-      "stepNumber": 1,
-      "gherkinStep": "Given I am on the login page",
-      "testData": "URL: https://app.example.com/login",
-      "expectedResult": "Login page loads successfully with username and password fields visible"
-    },
-    {
-      "stepNumber": 2,
-      "gherkinStep": "When I enter valid username in the username field",
-      "testData": "Username: testuser@example.com",
-      "expectedResult": "Username is entered without any validation errors"
-    },
-    {
-      "stepNumber": 3,
-      "gherkinStep": "And I enter invalid password in the password field",
-      "testData": "Password: WrongPassword123",
-      "expectedResult": "Invalid password is entered and masked with asterisks or dots"
-    },
-    {
-      "stepNumber": 4,
-      "gherkinStep": "And I click the Login button",
-      "testData": "N/A",
-      "expectedResult": "Login button is clickable and triggers authentication process"
-    },
-    {
-      "stepNumber": 5,
-      "gherkinStep": "Then I should see an error message",
-      "testData": "N/A",
-      "expectedResult": "Error message 'Invalid username or password' is displayed in red text below login form"
-    }
-  ]
-}
-
-Additional Instructions:
-1. For each test case:
-   - Ensure the BDD Scenarios (Given, When, Then) are clearly broken down and exhaustive.
-   - Include all possible validation, error-handling, and edge-case scenarios.
-   - Ensure scenarios align with the acceptance criteria and interdependencies.
-   - Test data must be specific and actionable (e.g., "Username: admin@test.com, Password: Admin123!" not "valid credentials" or "laptop/equipment").
-2. Provide test cases that include:
-   - Validations for common functionalities like adding, editing, managing, and deleting data.
-   - Multi-step processes, especially those requiring confirmations or transactions.
-   - Error handling, validation messages, and workflows involving conflicting or missing data.
-3. Ensure the test cases are exhaustive and detailed, covering maximum functional scenarios, but are presented in a clear and concise format.
-4. We need test cases for every user story after breaking that into logical steps.
-
-
-
-# from pypdf import PdfReader
-
-# reader = PdfReader("W8.pdf")
-# fields = reader.get_fields()
-# if fields:
-#     print("Found:")
-#     for k in fields.keys():
-#         print(k)
-# else:
-#     print("not found")
-from pypdf import PdfReader, PdfWriter
-
-def fill_pdf_form(input_pdf_path, output_pdf_path, field_data):
-    """
-    Fill PDF form fields and save to a new file
-    
-    Args:
-        input_pdf_path (str): Path to the input PDF file
-        output_pdf_path (str): Path where the filled PDF will be saved
-        field_data (dict): Dictionary with field names as keys and values to fill
-    """
-    
-    # Read the PDF
-    reader = PdfReader(input_pdf_path)
-    writer = PdfWriter()
-    
-    # Clone reader to writer
-    writer.clone_reader_document_root(reader)
-    
-    # Fill the form fields
-    if writer.get_fields():
-        for field_name, field_value in field_data.items():
-            writer.update_page_form_field_values(
-                writer.pages[0], {field_name: field_value}
-            )
-    else:
-        print("No form fields found in the PDF")
-        return False
-    
-    # Save the filled PDF
-    with open(output_pdf_path, 'wb') as output_file:
-        writer.write(output_file)
-    
-    print(f"PDF successfully filled and saved as: {output_pdf_path}")
-    return True
-
-# Define the data to fill in the form
-field_data = {
-    "topmostSubform[0].Page1[0].f1_1[0]": "hello this is palllavik",
-    "topmostSubform[0].Page1[0].f1_2[0]": "hyd"
-}
-
-# Fill the PDF form
-if __name__ == "__main__":
-    input_pdf = "W8.pdf"
-    output_pdf = "W8_filled.pdf"
-    
-    try:
-        success = fill_pdf_form(input_pdf, output_pdf, field_data)
-        if success:
-            print("Form filling completed successfully!")
-        else:
-            print("Form filling failed!")
-    except FileNotFoundError:
-        print(f"Error: Could not find the file '{input_pdf}'")
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
