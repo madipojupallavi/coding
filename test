@@ -185,3 +185,465 @@ w9_simple_field_labels = {
     "f1_14[0]": "EIN (##)",
     "f1_15[0]": "EIN (#######)",
 }
+
+
+from pypdf import PdfReader, PdfWriter
+import re
+from datetime import datetime
+import json
+
+# Sample data as provided
+sample_data = {
+    "1": "Acme Corporation Ltd.",
+    "2": "No foreign branches",
+    "3": "123 Main Street, London, UK",
+    "4": "456 Business Avenue, New York, USA",
+    "5": "2020-06-15",
+    "ComboBox1": "Yes",
+    "6 a1": "NYSE: ACME",
+    "ComboBox2": "No",
+    "ComboBox3": "No",
+    "ComboBox4": "Yes",
+    "6 d1": "Privately held by family trust",
+    "7": "10%",
+    "ComboBox5": "No",
+    "9": "Financial Conduct Authority",
+    "10": "LEI-1234-5678-9012",
+    "11": "Global Holdings Inc.",
+    "12": "United States",
+    "ComboBox6": "Yes",
+    "110 a": "Quarterly penetration testing",
+    "110 b": "24/7 monitoring with SIEM",
+    "dp1": "Acme Bank Ltd.",
+    "dp2": "Jane Smith",
+    "dp3": "Robert Johnson",
+    "dp4": "2025-09-08",
+    "dp5": "London, UK",
+    "Textfield": "Jane Smith, Head of Correspondent Banking",
+    "Textfield-0": "Robert Johnson, MLRO"
+}
+
+# Field labels for reference
+field_labels = {
+    "1": "Full Legal Name",
+    "2": "Foreign branches",
+    "3": "Registered Address", 
+    "4": "Business Address",
+    "5": "Incorporation Date",
+    "ComboBox1": "Publicly traded (Q6a)",
+    "6 a1": "Exchange and ticker",
+    "ComboBox2": "Member owned (Q6b)",
+    "ComboBox3": "Government owned (Q6c)",
+    "ComboBox4": "Privately owned (Q6d)",
+    "6 d1": "Private ownership details",
+    "7": "Bearer shares percentage (Q7)",
+    "ComboBox5": "Offshore banking license (Q8)",
+    "9": "Primary regulator",
+    "10": "LEI Code",
+    "11": "Ultimate parent",
+    "12": "Parent jurisdiction",
+    "ComboBox6": "Retail banking",
+    "ComboBox7": "Private banking",
+    "ComboBox8": "Commercial banking",
+    "ComboBox9": "Transactional banking",
+    "ComboBox10": "Investment banking",
+    "ComboBox11": "Financial markets",
+    "ComboBox12": "Securities services",
+    "ComboBox13": "Broker dealer",
+    "ComboBox14": "Multilateral dev bank",
+    "13j": "Other business",
+    "ComboBox15": "Non-resident customers (Q14)",
+    "14a": "Countries",
+    "ComboBox16": "Number of employees",
+    "ComboBox17": "Total assets",
+    "ComboBox18": "Responses representative (Q16)",
+    "ComboBox19": "Trade finance",
+    "ComboBox20": "Foreign exchange",
+    "ComboBox21": "Money transfer services",
+    "ComboBox22": "Clearing services",
+    "ComboBox23": "Settlement services",
+    "ComboBox44": "Written AML policies",
+    "ComboBox45": "Board approved AML program",
+    "ComboBox46": "AML officer designation",
+    "ComboBox47": "Independent AML audit",
+    "ComboBox48": "AML training program",
+    "ComboBox72": "CDD procedures",
+    "ComboBox73": "Enhanced due diligence",
+    "ComboBox74": "Ongoing monitoring",
+    "ComboBox75": "Beneficial ownership identification",
+    "ComboBox90": "Transaction monitoring system",
+    "ComboBox91": "Suspicious activity reporting",
+    "ComboBox92": "Currency transaction reporting",
+    "ComboBox93": "Sanctions screening",
+    "ComboBox94": "Wire transfer procedures",
+    "ComboBox95": "Record retention policies",
+    "ComboBox96": "Customer records maintained",
+    "ComboBox97": "Transaction records maintained",
+    "16a": "Employee count details",
+    "16b": "Asset size details",
+    "17p": "Institution type",
+    "18": "Representative confirmation",
+    "18b": "Representative details",
+    "23 a": "Regulatory framework",
+    "24": "Compliance areas",
+    "24b": "Reporting requirements",
+    "39 a": "Geographic regions",
+    "39 b": "Country presence",
+    "46 a": "Office locations",
+    "46 b": "Office types",
+    "49 a": "Certifications",
+    "52 a": "Auditor type",
+    "53 a": "Audit frequency",
+    "53 b": "Internal audit schedule",
+    "57 d": "Monitoring approach",
+    "60F": "Transaction monitoring systems",
+    "70 V": "Real-time screening",
+    "71": "Risk scoring capabilities",
+    "73 a": "Monitoring coverage",
+    "73 b": "Detection systems",
+    "76": "Case management tools",
+    "79 a": "Security architecture",
+    "79 b": "Encryption and communications",
+    "81 b1": "SWIFT compliance",
+    "81 c": "Cross-border payment screening",
+    "85 a": "Customer risk profiling",
+    "85 b": "Risk assessment capabilities",
+    "93f": "Sanctions and PEP screening",
+    "97 a": "Audit trail maintenance",
+    "97 b": "Regulatory reporting systems",
+    "102a": "Defense model",
+    "102b": "Risk management function",
+    "105 a": "Staff training",
+    "105 b": "Professional development",
+    "108 i": "Incident response planning",
+    "110 a": "Security testing",
+    "110 b": "Continuous monitoring",
+    "dp1": "Institution name",
+    "dp2": "Correspondent Banking Head",
+    "dp3": "MLRO",
+    "dp4": "Date",
+    "dp5": "Location",
+    "Textfield": "Correspondent Banking Head details",
+    "Textfield-0": "MLRO details"
+}
+
+def get_page_number_from_field(field_name):
+    """
+    Extract page number from field name
+    Returns the page number (1-indexed) or None if not found
+    """
+    patterns = [
+        r'\.Page(\d+)\[',
+        r'page(\d+)',
+        r'Page(\d+)',
+        r'p(\d+)_',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, field_name, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return 1  # Default to page 1 if no page info found
+
+def group_fields_by_page(field_data):
+    """
+    Group field data by page number
+    """
+    page_fields = {}
+    
+    for field_name, field_value in field_data.items():
+        page_num = get_page_number_from_field(field_name)
+        if page_num not in page_fields:
+            page_fields[page_num] = {}
+        page_fields[page_num][field_name] = field_value
+    
+    return page_fields
+
+def load_data_from_dict(data_dict):
+    """
+    Load data from a dictionary (like sample_data)
+    """
+    return data_dict
+
+def load_data_from_json(json_file_path):
+    """
+    Load data from a JSON file
+    """
+    try:
+        with open(json_file_path, 'r', encoding='utf-8') as file:
+            return json.load(file)
+    except Exception as e:
+        print(f"Error loading JSON file: {str(e)}")
+        return {}
+
+def validate_field_data(field_data, available_fields):
+    """
+    Validate that field data keys exist in the PDF form
+    """
+    valid_data = {}
+    invalid_fields = []
+    
+    for field_name, field_value in field_data.items():
+        if field_name in available_fields:
+            valid_data[field_name] = field_value
+        else:
+            invalid_fields.append(field_name)
+    
+    if invalid_fields:
+        print(f"Warning: {len(invalid_fields)} fields not found in PDF:")
+        for field in invalid_fields[:10]:  # Show first 10 invalid fields
+            field_label = field_labels.get(field, "Unknown field")
+            print(f"  - {field} ({field_label})")
+        if len(invalid_fields) > 10:
+            print(f"  ... and {len(invalid_fields)-10} more")
+    
+    print(f"Valid fields to fill: {len(valid_data)}/{len(field_data)}")
+    return valid_data
+
+def fill_cbddq_form(input_pdf_path, output_pdf_path, field_data):
+    """
+    Fill CBDDQ form with provided data
+    """
+    try:
+        reader = PdfReader(input_pdf_path)
+        writer = PdfWriter()
+        writer.clone_reader_document_root(reader)
+        
+        if not writer.get_fields():
+            print("No form fields found")
+            return False
+        
+        # Validate field data against available fields
+        available_fields = set(writer.get_fields().keys())
+        validated_data = validate_field_data(field_data, available_fields)
+        
+        if not validated_data:
+            print("No valid field data to fill")
+            return False
+        
+        # Group fields by page
+        page_fields = group_fields_by_page(validated_data)
+        print(f"Fields grouped by page: {list(page_fields.keys())}")
+        
+        fields_updated = 0
+        total_fields_attempted = 0
+        
+        # Update each page with its specific fields
+        for page_num, page in enumerate(writer.pages, 1):
+            if page_num in page_fields:
+                page_field_data = page_fields[page_num]
+                print(f"\nPage {page_num}: Attempting to update {len(page_field_data)} fields")
+                
+                for field_name, field_value in page_field_data.items():
+                    field_label = field_labels.get(field_name, "Unknown field")
+                    print(f"  Updating: {field_name} ({field_label}) = '{field_value}'")
+                    total_fields_attempted += 1
+                
+                try:
+                    writer.update_page_form_field_values(page, page_field_data)
+                    fields_updated += len(page_field_data)
+                    print(f"  ✓ Successfully updated {len(page_field_data)} fields on page {page_num}")
+                except Exception as e:
+                    print(f"  ✗ Error updating page {page_num}: {str(e)}")
+            else:
+                print(f"Page {page_num}: No fields to update")
+        
+        with open(output_pdf_path, 'wb') as output_file:
+            writer.write(output_file)
+        
+        print(f"\nSummary: Updated {fields_updated}/{total_fields_attempted} fields")
+        return True
+        
+    except Exception as e:
+        print(f"Error filling form: {str(e)}")
+        return False
+
+def get_form_fields(input_pdf_path):
+    """
+    Extract all form field names from the PDF
+    """
+    try:
+        reader = PdfReader(input_pdf_path)
+        writer = PdfWriter()
+        writer.clone_reader_document_root(reader)
+        
+        fields = writer.get_fields()
+        if fields:
+            print(f"Found {len(fields)} form fields:")
+            
+            # Categorize fields
+            text_fields = []
+            combo_fields = []
+            other_fields = []
+            
+            for field_name, field_obj in sorted(fields.items()):
+                field_type = field_obj.get('/FT', 'Unknown')
+                field_value = field_obj.get('/V', '')
+                
+                if field_type == '/Tx':  # Text field
+                    text_fields.append((field_name, field_value))
+                elif field_type == '/Ch':  # Choice/Combo field
+                    combo_fields.append((field_name, field_value))
+                else:
+                    other_fields.append((field_name, field_type, field_value))
+            
+            print(f"\nText Fields ({len(text_fields)}):")
+            for field_name, value in text_fields[:20]:
+                label = field_labels.get(field_name, "No label")
+                print(f"  {field_name}: '{value}' - {label}")
+            
+            print(f"\nCombo/Choice Fields ({len(combo_fields)}):")
+            for field_name, value in combo_fields[:20]:
+                label = field_labels.get(field_name, "No label")
+                print(f"  {field_name}: '{value}' - {label}")
+            
+            if other_fields:
+                print(f"\nOther Fields ({len(other_fields)}):")
+                for field_name, field_type, value in other_fields[:10]:
+                    label = field_labels.get(field_name, "No label")
+                    print(f"  {field_name} ({field_type}): '{value}' - {label}")
+                    
+        else:
+            print("No form fields found")
+            
+        return fields
+    except Exception as e:
+        print(f"Error reading form fields: {str(e)}")
+        return {}
+
+def verify_filled_pdf(pdf_path):
+    """
+    Verify if the PDF was filled with proper content
+    """
+    print(f"\n=== VERIFYING FILLED PDF: {pdf_path} ===")
+    try:
+        reader = PdfReader(pdf_path)
+        writer = PdfWriter()
+        writer.clone_reader_document_root(reader)
+        
+        fields = writer.get_fields()
+        if not fields:
+            print("No fields found in filled PDF")
+            return
+        
+        filled_fields = {}
+        for field_name, field_obj in fields.items():
+            value = field_obj.get('/V', None)
+            if value and str(value).strip() not in ['', ' ']:
+                filled_fields[field_name] = value
+        
+        print(f"Filled fields: {len(filled_fields)}/{len(fields)}")
+        print("\nSample of filled fields:")
+        for i, (field_name, value) in enumerate(list(filled_fields.items())[:15]):
+            label = field_labels.get(field_name, "Unknown field")
+            display_value = str(value)[:50] + "..." if len(str(value)) > 50 else str(value)
+            print(f"  {field_name} ({label}): '{display_value}'")
+        
+        if len(filled_fields) > 15:
+            print(f"  ... and {len(filled_fields)-15} more filled fields")
+        
+    except Exception as e:
+        print(f"Error verifying PDF: {str(e)}")
+
+def create_sample_json_file(filename="sample_cbddq_data.json"):
+    """
+    Create a sample JSON file with the data structure
+    """
+    with open(filename, 'w', encoding='utf-8') as file:
+        json.dump(sample_data, file, indent=2, ensure_ascii=False)
+    print(f"Sample JSON file created: {filename}")
+
+def print_field_mapping_info():
+    """
+    Print information about field mappings
+    """
+    print("=== FIELD MAPPING INFORMATION ===")
+    print(f"Total field mappings defined: {len(field_labels)}")
+    print(f"Sample data fields: {len(sample_data)}")
+    
+    # Show sample data fields and their labels
+    print("\nSample data fields:")
+    for field_name, value in list(sample_data.items())[:20]:
+        label = field_labels.get(field_name, "Unknown field")
+        display_value = str(value)[:40] + "..." if len(str(value)) > 40 else str(value)
+        print(f"  {field_name}: '{display_value}' ({label})")
+    
+    if len(sample_data) > 20:
+        print(f"  ... and {len(sample_data)-20} more fields")
+
+# Main execution function
+def main():
+    input_pdf = "CBDDQ.pdf"  # Your CBDDQ PDF file
+    output_pdf = "CBDDQ_filled_with_sample_data.pdf"
+    
+    print("=== CBDDQ FORM FILLER WITH SAMPLE DATA ===")
+    
+    # Print field mapping information
+    print_field_mapping_info()
+    
+    # Create sample JSON file for reference
+    create_sample_json_file()
+    
+    # Inspect the form fields
+    print("\n1. Getting form field structure...")
+    fields = get_form_fields(input_pdf)
+    
+    if not fields:
+        print("No form fields found. The PDF might not be fillable.")
+        return
+    
+    # Load data (using sample_data directly, but you can also load from JSON)
+    print("\n2. Loading data...")
+    # data_to_fill = load_data_from_json("sample_cbddq_data.json")  # Alternative: load from JSON
+    data_to_fill = sample_data  # Using sample data directly
+    
+    if not data_to_fill:
+        print("No data to fill")
+        return
+    
+    print(f"Loaded {len(data_to_fill)} fields from data source")
+    
+    # Fill the form
+    print(f"\n3. Filling form...")
+    success = fill_cbddq_form(input_pdf, output_pdf, data_to_fill)
+    
+    if success:
+        print(f"\n4. Verifying filled form...")
+        verify_filled_pdf(output_pdf)
+        print(f"\n✓ CBDDQ form filled successfully!")
+        print(f"✓ Input: {input_pdf}")
+        print(f"✓ Output: {output_pdf}")
+        print(f"✓ Sample JSON reference: sample_cbddq_data.json")
+    else:
+        print("\n✗ Failed to fill CBDDQ form")
+
+def fill_with_custom_data(custom_data, input_pdf="CBDDQ.pdf", output_pdf=None):
+    """
+    Fill form with custom data dictionary
+    """
+    if output_pdf is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_pdf = f"CBDDQ_filled_{timestamp}.pdf"
+    
+    print(f"Filling form with custom data...")
+    print(f"Input: {input_pdf}")
+    print(f"Output: {output_pdf}")
+    print(f"Data fields: {len(custom_data)}")
+    
+    success = fill_cbddq_form(input_pdf, output_pdf, custom_data)
+    
+    if success:
+        verify_filled_pdf(output_pdf)
+        print(f"✓ Form filled successfully: {output_pdf}")
+        return output_pdf
+    else:
+        print("✗ Failed to fill form")
+        return None
+
+if __name__ == "__main__":
+    # Run main function with sample data
+    main()
+    
+    # Example of using custom data:
+    # custom_data = {"1": "My Company Ltd.", "ComboBox1": "No", "dp4": "2025-09-08"}
+    # fill_with_custom_data(custom_data)
